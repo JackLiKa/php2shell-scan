@@ -39,7 +39,7 @@ import subprocess
 import sys
 import time
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 FIXED = {2: 35, 3: 36, 4: 27, 5: 12}   # PHP 8.X must be >= 8.X.FIXED[X]
 FIXED_STR = "8.2.35 / 8.3.36 / 8.4.27 / 8.5.12"
@@ -175,6 +175,101 @@ class HostExec:
                 return False
         out = self._run(f"grep -l {shlex.quote(needle)} {shlex.quote(p)} 2>/dev/null")
         return bool(out and p in out)
+
+
+# ---------------------------------------------------------------- crawler
+
+# static resources & files we never crawl/scan
+STATIC_EXT = re.compile(
+    r"\.(css|js|mjs|map|png|jpe?g|gif|svg|ico|webp|avif|bmp|"
+    r"woff2?|ttf|otf|eot|mp[34]|webm|mov|avi|pdf|zip|rar|7z|gz|tar|"
+    r"docx?|xlsx?|pptx?|csv|xml|txt|md|json|wasm|data)([?#].*)?$", re.I)
+
+SKIP_SCHEMES = ("mailto:", "tel:", "javascript:", "data:", "ftp:")
+
+
+def crawl_site(target, cookie=None, max_pages=50, max_depth=3, timeout=10):
+    """Same-domain BFS crawler. Returns (pages, endpoints):
+      pages     — crawlable HTML page URLs (deduped)
+      endpoints — form action URLs found on those pages ("interfaces")
+    Only follows same-domain links; skips static assets and externals."""
+    u = urlparse(target if "://" in target else "http://" + target)
+    host, tls = u.hostname, u.scheme == "https"
+    port = u.port or (443 if tls else 80)
+    seen = set()
+    pages, endpoints = [], set()
+    origin = (f"{'https' if tls else 'http'}://{host}"
+              f"{':' + str(port) if port not in (80, 443) else ''}")
+    queue = [(u.path or "/", 0)]
+    cookie_line = f"Cookie: {cookie}\r\n" if cookie else ""
+
+    def norm(path):
+        path = path.split("#", 1)[0]
+        return path or "/"
+
+    while queue and len(pages) < max_pages:
+        path, depth = queue.pop(0)
+        path = norm(path)
+        if path in seen:
+            continue
+        seen.add(path)
+        if STATIC_EXT.search(path):
+            continue
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n" + cookie_line +
+               "Connection: close\r\n\r\n").encode()
+        try:
+            resp = http(host, port, req, tls=tls, timeout=timeout)
+        except OSError:
+            continue
+        if not resp:
+            continue
+        head, body = split(resp)
+        status = head.split("\r\n", 1)[0]
+        # follow redirects once (same-domain Location)
+        m = re.search(r"^HTTP/1\.\d\s+30[0-9]", status)
+        loc = re.search(r"Location:\s*([^\r\n]+)", head, re.I)
+        if m and loc:
+            # redirects don't consume link depth — follow at same depth
+            t = loc.group(1).strip()
+            if t.startswith("/") or not urlparse(t).netloc:
+                # same-host absolute-path or relative redirect (e.g. "login.php")
+                queue.append((norm(urljoin(path, t)), depth))
+            elif urlparse(t).hostname == host:
+                queue.append((norm(urlparse(t).path or "/"), depth))
+            continue
+        ctype = re.search(r"Content-Type:\s*([^\r\n;]+)", head, re.I)
+        if ctype and "html" not in ctype.group(1).lower():
+            continue
+        pages.append(origin + path)
+        if depth >= max_depth:
+            continue
+        html = body.decode("utf-8", "replace")
+        for link in re.findall(
+                r'''(?:href|action)\s*=\s*["']([^"']+)["']''', html, re.I):
+            link = link.strip()
+            if not link or link.startswith(SKIP_SCHEMES) or link.startswith("#"):
+                continue
+            if link.startswith("//"):
+                continue                          # protocol-relative external
+            lu = urlparse(link)
+            if lu.netloc and lu.hostname != host:
+                continue                          # external domain — skip
+            # resolve relative links (about.php, ../x, ?q=1) against page path
+            fu = urlparse(urljoin(path, link))
+            lp = norm(fu.path or "/")
+            if fu.query:
+                lp += "?" + fu.query
+            if STATIC_EXT.search(lp):
+                continue
+            # form actions are endpoints; links are crawlable pages
+            tag_is_form = bool(re.search(
+                r'''action\s*=\s*["']''' + re.escape(link) + r'''["']''',
+                html, re.I))
+            if tag_is_form:
+                endpoints.add(origin + lp)
+            elif lp not in seen:
+                queue.append((lp, depth + 1))
+    return pages, sorted(endpoints)
 
 
 # ---------------------------------------------------------------- remote
@@ -1067,6 +1162,14 @@ def main():
     ap.add_argument("--target", help="remote target URL, e.g. http://127.0.0.1:8080/app/")
     ap.add_argument("--targets", help="file with one target URL per line "
                     "(# comments allowed) — batch mode")
+    ap.add_argument("--crawl", action="store_true",
+                    help="recursively crawl the --target domain (same-domain "
+                         "links + form endpoints; static assets and external "
+                         "domains skipped) and scan every discovered page")
+    ap.add_argument("--crawl-depth", type=int, default=3,
+                    help="max link depth for --crawl (default 3)")
+    ap.add_argument("--max-pages", type=int, default=50,
+                    help="max pages for --crawl (default 50)")
     ap.add_argument("--path", help="local PHP project dir for code/config audit")
     ap.add_argument("--probe-path", default=None,
                     help="endpoint to probe (default: path from --target URL; "
@@ -1112,6 +1215,23 @@ def main():
     if args.targets:
         urls += [l.strip() for l in open(args.targets)
                  if l.strip() and not l.strip().startswith("#")]
+    if args.crawl:
+        if not args.target:
+            ap.error("--crawl requires --target")
+        print(f"[*] Crawling {args.target} "
+              f"(depth<={args.crawl_depth}, max {args.max_pages} pages)",
+              file=sys.stderr)
+        try:
+            pages, endpoints = crawl_site(args.target, cookie=args.cookie,
+                                          max_pages=args.max_pages,
+                                          max_depth=args.crawl_depth,
+                                          timeout=args.timeout)
+        except OSError as e:
+            ap.error(f"crawl failed: {e}")
+        print(f"[+] crawl done: {len(pages)} page(s), "
+              f"{len(endpoints)} form endpoint(s)", file=sys.stderr)
+        urls = pages + endpoints
+    urls = list(dict.fromkeys(urls))
     host_ch = HostExec(session_path=args.session_path, exec_cmd=args.exec_cmd)
     if args.confirm and urls and not host_ch.available:
         print("[!] --confirm without --session-path/--exec-cmd: "
