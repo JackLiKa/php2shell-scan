@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+"""
+php-scan — CVE-2026-109618 / CVE-2026-109619 exposure scanner.
+
+Defensive scanner. Probes EXPOSURE and PREREQUISITES only — never sends
+memory-corruption payloads, never crashes workers, never injects code.
+
+Modes:
+  --target URL    Remote black-box probe (headers, session fixation,
+                  upload_progress reachability, SAPI).
+  --path DIR      Local code/config audit (php.ini, .user.ini handler
+                  mismatch, unserialize/LFI sinks, __destruct gadgets).
+  --confirm       Behavioral confirmation: actually triggers BENIGN
+                  primitives and verifies their fingerprints server-side
+                  (session file creation, marker in session data, and —
+                  for mod_php — the "Unknown on line 0" OOM signature).
+                  Requires a host-side channel:
+                    --session-path DIR   session dir reachable locally
+                                         (mounted volume / same host)
+                    --exec-cmd 'TEMPLATE' run checks on host, {cmd}
+                                         placeholder, e.g.
+                                         'docker exec c sh -c "{cmd}"'
+                                         'ssh host "{cmd}"'
+
+Verdict tiers: affected (version) < confirmed (behavior fingerprint
+observed) < exploited (real RCE echo — not implemented, use lab exploit).
+
+For authorized security assessment only.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import uuid
+from urllib.parse import urlparse
+
+FIXED = {2: 35, 3: 36, 4: 27, 5: 12}   # PHP 8.X.FIXED[X]
+FIXED_STR = "8.2.35 / 8.3.36 / 8.4.27 / 8.5.12"
+
+
+# ---------------------------------------------------------------- utils
+
+def http(host, port, raw, tls=False, timeout=10):
+    s = socket.create_connection((host, port), timeout=timeout)
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        s = ctx.wrap_socket(s, server_hostname=host)
+    s.sendall(raw)
+    s.settimeout(timeout)
+    resp = b""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            resp += d
+    except (socket.timeout, ConnectionResetError, ssl.SSLError, OSError):
+        pass
+    s.close()
+    return resp
+
+
+def split(resp):
+    head, _, body = resp.partition(b"\r\n\r\n")
+    return head.decode("latin1", "replace"), body
+
+
+# ---------------------------------------------------------------- host channel
+
+class HostExec:
+    """Host-side verification channel for --confirm mode.
+
+    Two transports:
+      session_path: read session files directly (same host / mounted volume)
+      exec_cmd:     run shell commands on the host ({cmd} placeholder)
+    """
+
+    def __init__(self, session_path=None, exec_cmd=None):
+        self.session_path = session_path
+        self.exec_cmd = exec_cmd
+
+    @property
+    def available(self):
+        return bool(self.session_path or self.exec_cmd)
+
+    def _run(self, cmd):
+        if not self.exec_cmd:
+            return None
+        full = self.exec_cmd.replace("{cmd}", cmd)
+        try:
+            r = subprocess.run(full, shell=True, capture_output=True,
+                               text=True, timeout=15)
+            return (r.stdout or "") + (r.stderr or "")
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return f"__exec_error:{e}"
+
+    def _path(self, name):
+        """Resolve a session file path on the host."""
+        return os.path.join(self.session_path, name) if self.session_path else name
+
+    def file_exists(self, name):
+        p = self._path(name)
+        if self.session_path and not self.exec_cmd:
+            return os.path.exists(p)
+        out = self._run(f"test -f {shlex.quote(p)} && echo YES || echo NO")
+        return bool(out and "YES" in out)
+
+    def file_contains(self, name, needle):
+        p = self._path(name)
+        if self.session_path and not self.exec_cmd:
+            try:
+                return needle in open(p, errors="replace").read()
+            except OSError:
+                return False
+        out = self._run(f"grep -l {shlex.quote(needle)} {shlex.quote(p)} 2>/dev/null")
+        return bool(out and p in out)
+
+
+# ---------------------------------------------------------------- remote
+
+class RemoteScan:
+    def __init__(self, target, path="/", timeout=10, host=None, confirm=False,
+                 oom_mb=64, cookie=None):
+        u = urlparse(target if "://" in target else "http://" + target)
+        self.host = u.hostname
+        self.tls = u.scheme == "https"
+        self.port = u.port or (443 if self.tls else 80)
+        self.base = u.path.rstrip("/") or ""
+        self.probe_path = path
+        self.timeout = timeout
+        self.host_ch = host or HostExec()
+        self.confirm = confirm
+        self.oom_mb = oom_mb
+        # user-supplied Cookie header minus any PHPSESSID we override
+        self.cookie = self._strip_sid(cookie or "")
+        self.checks = {}
+
+    @staticmethod
+    def _strip_sid(cookie):
+        parts = [p.strip() for p in cookie.split(";")
+                 if p.strip() and not p.strip().lower().startswith("phpsessid=")]
+        return "; ".join(parts)
+
+    def _cookie_line(self, extra=None):
+        c = "; ".join(x for x in (extra, self.cookie) if x)
+        return f"Cookie: {c}\r\n" if c else ""
+
+    def _get(self, path, cookie=None):
+        req = (f"GET {path} HTTP/1.1\r\nHost: {self.host}\r\n"
+               + self._cookie_line(cookie)
+               + "Connection: close\r\n\r\n").encode()
+        return http(self.host, self.port, req, tls=self.tls, timeout=self.timeout)
+
+    def _upload(self, path, fields, filename="probe.txt"):
+        b = "PHPSCAN" + uuid.uuid4().hex[:8]
+        body = b""
+        for n, v in fields.items():
+            body += (f"--{b}\r\nContent-Disposition: form-data; "
+                     f'name="{n}"\r\n\r\n{v}\r\n').encode("latin-1")
+        body += (f"--{b}\r\nContent-Disposition: form-data; name=\"f\"; "
+                 f'filename="{filename}"\r\n\r\nZ\r\n--{b}--\r\n').encode("latin-1")
+        req = (f"POST {path} HTTP/1.1\r\nHost: {self.host}\r\n"
+               f"Content-Type: multipart/form-data; boundary={b}\r\n"
+               + self._cookie_line()
+               + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+               ).encode() + body
+        return http(self.host, self.port, req, tls=self.tls, timeout=self.timeout)
+
+    def fingerprint(self):
+        resp = self._get(self.probe_path)
+        if not resp:
+            self.checks["reachable"] = {"status": "fail", "detail": "no response"}
+            return False
+        head, body = split(resp)
+        powered = re.search(r"X-Powered-By:\s*([^\r\n]+)", head, re.I)
+        server = re.search(r"Server:\s*([^\r\n]+)", head, re.I)
+        self.checks["reachable"] = {"status": "ok", "detail": head.splitlines()[0] if head else ""}
+        self.checks["server_header"] = {"status": "info",
+                                        "detail": server.group(1).strip() if server else "absent"}
+        self.checks["x_powered_by"] = {"status": "info",
+                                       "detail": powered.group(1).strip() if powered else "absent"}
+        # version from header or phpinfo-style body
+        ver = None
+        src = (powered.group(1) if powered else "") + " " + body.decode("latin1", "replace")
+        m = re.search(r"PHP[/ ]?(\d+)\.(\d+)\.(\d+)", src)
+        if m:
+            ver = tuple(int(x) for x in m.groups())
+        self.checks["php_version"] = (
+            {"status": "ok", "detail": ".".join(map(str, ver))} if ver
+            else {"status": "unknown", "detail": "not disclosed (expose_php may be Off)"})
+        self._ver = ver
+        # SAPI guess
+        sapi = "unknown"
+        if server and "apache" in server.group(1).lower() and powered and "PHP" in powered.group(1):
+            sapi = "likely mod_php (Apache + PHP header)"
+        if b"fpm-fcgi" in body.lower():
+            sapi = "php-fpm"
+        self.checks["sapi"] = {"status": "info", "detail": sapi}
+        return True
+
+    def version_verdict(self):
+        v = self._ver
+        if not v:
+            self.checks["cve_affected"] = {
+                "status": "unknown",
+                "detail": f"version not disclosed; verify manually against {FIXED_STR}"}
+            return
+        major, minor, patch = v
+        if major < 8 or (major == 8 and minor < 2):
+            st, det = "affected", f"PHP {major}.{minor}.{patch} is EOL — no fix, upgrade required"
+        elif major == 8 and 2 <= minor <= 5:
+            st = "affected" if patch < FIXED[minor] else "patched"
+            det = f"PHP {major}.{minor}.{patch} {'<' if st=='affected' else '>='} fixed 8.{minor}.{FIXED[minor]}"
+        else:
+            st, det = "unknown", f"PHP {major}.{minor}.{patch} outside documented range"
+        self.checks["cve_affected"] = {"status": st, "detail": det}
+
+    def upload_progress_probe(self, sid):
+        """Benign: send PHP_SESSION_UPLOAD_PROGRESS with a probe SID via POST body.
+        upload_progress accepts the SID without auth; we then test whether the
+        fixated SID is honored on a follow-up request (session fixation)."""
+        resp = self._upload(self.probe_path,
+                            {"PHPSESSID": sid, "PHP_SESSION_UPLOAD_PROGRESS": "x"})
+        if not resp:
+            self.checks["upload_progress"] = {"status": "unknown", "detail": "no response"}
+            return
+        head, _ = split(resp)
+        ok = " 200" in head.split("\r\n", 1)[0] or " 302" in head.split("\r\n", 1)[0]
+        # upload_progress rejecting requests usually produces a PHP warning/error
+        rejected = b"upload_progress" in resp.lower() and b"disabled" in resp.lower()
+        if rejected:
+            self.checks["upload_progress"] = {
+                "status": "not_exposed", "detail": "server reports feature disabled"}
+        elif ok:
+            if self.confirm and self.host_ch.available:
+                if self.host_ch.file_exists(f"sess_{sid}"):
+                    self.checks["upload_progress"] = {
+                        "status": "confirmed",
+                        "detail": f"sess_{sid} created on host — upload_progress "
+                                  "accepted a session id from POST body (pre-auth)"}
+                    self._fixation_confirmed = True
+                    return
+                self.checks["upload_progress"] = {
+                    "status": "not_confirmed",
+                    "detail": f"200 OK but no sess_{sid} found via host channel — "
+                              "check session.save_path matches --session-path"}
+            else:
+                self.checks["upload_progress"] = {
+                    "status": "likely_exposed",
+                    "detail": "multipart with PHP_SESSION_UPLOAD_PROGRESS accepted "
+                              "(confirm on host: check sess_" + sid + ")"}
+        else:
+            self.checks["upload_progress"] = {"status": "unknown",
+                                              "detail": head.split("\r\n", 1)[0]}
+
+    def session_fixation_probe(self, sid):
+        """Send PHPSESSID in POST body, then GET with that SID as cookie.
+        If the app/endpoint starts a session and honors the fixated SID
+        (no replacement Set-Cookie), fixation via POST body is viable."""
+        if getattr(self, "_fixation_confirmed", False):
+            self.checks["session_fixation"] = {
+                "status": "confirmed",
+                "detail": "session file created for POST-body SID — use_only_cookies "
+                          "bypassed by rfc1867 handler"}
+            return
+        resp = self._get(self.probe_path, cookie=f"PHPSESSID={sid}")
+        head, _ = split(resp)
+        m = re.search(r"Set-Cookie:\s*PHPSESSID=([^;\r\n]+)", head, re.I)
+        if m and m.group(1).strip() == sid:
+            detail, st = ("server re-issued the attacker-chosen SID — fixation accepted",
+                          "exposed")
+        elif m:
+            detail, st = ("server replaced SID — cookie-side fixation resisted "
+                          "(POST-body fixation may still work in rfc1867)", "partial")
+        elif resp:
+            detail, st = ("endpoint did not start a session for this SID probe; "
+                          "check sess_" + sid + " on host to confirm file creation",
+                          "inconclusive")
+        else:
+            detail, st = "no response", "unknown"
+        self.checks["session_fixation"] = {"status": st, "detail": detail}
+
+    def filename_injection_probe(self):
+        """Benign marker (NOT code) in filename → stored raw in session data.
+        Confirms the Chain A primitive without injecting anything executable."""
+        marker = "phpscan_marker_" + uuid.uuid4().hex[:12]
+        sid = "phpscanfi" + uuid.uuid4().hex[:18]
+        self._upload(self.probe_path,
+                     {"PHPSESSID": sid, "PHP_SESSION_UPLOAD_PROGRESS": "x"},
+                     filename=marker)
+        if self.confirm and self.host_ch.available:
+            if self.host_ch.file_contains(f"sess_{sid}", marker):
+                self.checks["filename_injection"] = {
+                    "status": "confirmed",
+                    "detail": f"marker '{marker}' found verbatim in sess_{sid} — "
+                              "raw filenames reach session storage "
+                              "(Chain A primitive; NOT fixed by the CVE patch)"}
+            else:
+                exists = self.host_ch.file_exists(f"sess_{sid}")
+                self.checks["filename_injection"] = {
+                    "status": "not_confirmed",
+                    "detail": (f"sess_{sid} exists but marker erased — "
+                               "upload_progress.cleanup=On removed it"
+                               if exists else
+                               f"no sess_{sid} found via host channel")}
+            return
+        self.checks["filename_injection"] = {
+            "status": "needs_host_check",
+            "detail": f"sent marker filename '{marker}' under sid '{sid}'; "
+                      f"confirm on host: grep {marker} <session.save_path>/sess_{sid} "
+                      "— if present, raw filenames reach session storage "
+                      "(Chain A primitive; NOT fixed by the CVE patch)"}
+
+    def oom_probe(self):
+        """Confirm the CVE-2026-109618 trigger primitive on mod_php:
+        a single oversized multipart field forces OOM during SAPI body
+        parsing — signature is 'Allowed memory size ... in Unknown on line 0'.
+
+        INTRUSIVE: causes one memory_limit fatal error in a worker.
+        Does NOT attempt corruption — no heap spray, single request only."""
+        boundary = "PHPSCANOOM" + uuid.uuid4().hex[:8]
+        head_part = (f"--{boundary}\r\n"
+                     f'Content-Disposition: form-data; name="phpscan_data"\r\n\r\n'
+                     ).encode()
+        tail = f"\r\n--{boundary}--\r\n".encode()
+        total = self.oom_mb * 1024 * 1024
+        # Chunked encoding: no Content-Length → bypasses post_max_size
+        # (documented OOM strategy in GHSA-w8hw-w9fx-j79w)
+        req = (f"POST {self.probe_path} HTTP/1.1\r\nHost: {self.host}\r\n"
+               f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+               + self._cookie_line()
+               + f"Transfer-Encoding: chunked\r\n"
+               f"Connection: close\r\n\r\n").encode()
+        s = socket.create_connection((self.host, self.port), timeout=30)
+        if self.tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            s = ctx.wrap_socket(s, server_hostname=self.host)
+
+        def ch(d):
+            s.sendall(f"{len(d):x}\r\n".encode() + d + b"\r\n")
+
+        s.sendall(req)
+        ch(head_part)
+        chunk = b"A" * (1024 * 1024)
+        sent = 0
+        while sent < total:
+            n = min(len(chunk), total - sent)
+            ch(chunk[:n])
+            sent += n
+        ch(tail)
+        s.sendall(b"0\r\n\r\n")
+        s.settimeout(30)
+        resp = b""
+        try:
+            while True:
+                d = s.recv(65536)
+                if not d:
+                    break
+                resp += d
+                if len(resp) > 1 << 20:
+                    break
+        except (socket.timeout, ConnectionResetError, ssl.SSLError, OSError):
+            pass
+        s.close()
+
+        body = resp.decode("latin1", "replace")
+        oom = "Allowed memory size" in body
+        sapi_scope = re.search(r"in\s*<?b?>?\s*Unknown", body) is not None
+        if oom and sapi_scope:
+            self.checks["oom_trigger"] = {
+                "status": "confirmed",
+                "detail": "OOM during SAPI multipart parsing observed "
+                          "('in Unknown on line 0') — CVE-2026-109618 trigger "
+                          "primitive present. Exploitation further requires "
+                          "heap control; this probe does not attempt it."}
+        elif oom:
+            self.checks["oom_trigger"] = {
+                "status": "partial",
+                "detail": "OOM fatal fired but in user code scope — primitive "
+                          "not confirmed at SAPI stage"}
+        elif resp:
+            status = resp.split(b"\r\n", 1)[0].decode("latin1", "replace")
+            self.checks["oom_trigger"] = {
+                "status": "not_triggered",
+                "detail": f"{status} — memory_limit not reached with "
+                          f"{self.oom_mb}MB (try --oom-mb larger)"}
+        else:
+            self.checks["oom_trigger"] = {"status": "unknown",
+                                          "detail": "no response"}
+
+    def run(self):
+        if not self.fingerprint():
+            return self.checks
+        self.version_verdict()
+        sid = "phpscan" + uuid.uuid4().hex[:20]
+        self.upload_progress_probe(sid)
+        self.session_fixation_probe(sid)
+        self.filename_injection_probe()
+        if self.confirm:
+            sapi = self.checks.get("sapi", {}).get("detail", "")
+            if "mod_php" in sapi or self.checks.get("cve_affected", {}).get(
+                    "status") == "affected":
+                self.oom_probe()
+            else:
+                self.checks["oom_trigger"] = {
+                    "status": "skip",
+                    "detail": "SAPI does not look like mod_php and version not "
+                              "confirmed affected; use --confirm-oom to force"}
+        return self.checks
+
+
+# ---------------------------------------------------------------- local
+
+class LocalScan:
+    """Audit code/config of an on-disk PHP project."""
+
+    SINKS = [
+        (re.compile(r"\bunserialize\s*\("), "unserialize() — possible object-injection sink"),
+        (re.compile(r"\b(include|include_once|require|require_once)\s*\(?\s*\$"),
+         "include/require of variable — LFI sink"),
+        (re.compile(r"ini_set\s*\(\s*['\"]session\.serialize_handler"),
+         "runtime session.serialize_handler change — Chain C mismatch enabler"),
+    ]
+    GADGET_DANGER = re.compile(
+        r"\b(system|exec|shell_exec|passthru|popen|eval|file_put_contents|"
+        r"unlink|call_user_func(?:_array)?)\s*\(")
+
+    def __init__(self, root):
+        import os
+        self.root = root
+        self.os = os
+        self.checks = {}
+
+    def ini_audit(self):
+        """Parse php.ini + every .user.ini; flag risk settings and
+        per-directory serialize_handler mismatches."""
+        os = self.os
+        handlers = {}
+        inis = []
+        for dirpath, _dirs, files in os.walk(self.root):
+            for f in files:
+                if f in ("php.ini", ".user.ini"):
+                    inis.append(os.path.join(dirpath, f))
+        if not inis:
+            self.checks["ini_audit"] = {"status": "skip", "detail": "no php.ini/.user.ini found"}
+            return
+        findings = []
+        for p in inis:
+            try:
+                txt = open(p, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            for m in re.finditer(r"^\s*([\w.\-]+)\s*=\s*(.+?)\s*$", txt, re.M):
+                k, v = m.group(1).lower(), m.group(2)
+                if k == "session.serialize_handler":
+                    handlers.setdefault(v.lower(), []).append(p)
+                if k == "session.upload_progress.enabled" and v.lower() in ("off", "0"):
+                    findings.append(f"{p}: upload_progress disabled (good)")
+                if k == "session.use_only_cookies" and v.lower() in ("0", "off"):
+                    findings.append(f"{p}: use_only_cookies=0 — session fixation easier")
+                if k == "memory_limit":
+                    findings.append(f"{p}: memory_limit={v} "
+                                    + ("(OOM trigger harder — good)"
+                                       if v.strip() == "-1" else "(OOM reachable)"))
+        if len(handlers) > 1:
+            findings.append("MULTIPLE serialize_handler values: " +
+                            "; ".join(f"{h} -> {len(ps)} file(s)" for h, ps in handlers.items()) +
+                            " — Chain C handler-mismatch precondition MET")
+        self.checks["ini_audit"] = {"status": "done",
+                                    "detail": "\n".join(findings) or "no notable settings"}
+
+    def sink_scan(self, max_files=20000):
+        os = self.os
+        hits = {desc: [] for _, desc in self.SINKS}
+        gadgets = []
+        n = 0
+        for dirpath, _dirs, files in os.walk(self.root):
+            for f in files:
+                if not f.endswith(".php"):
+                    continue
+                n += 1
+                if n > max_files:
+                    break
+                p = self.os.path.join(dirpath, f)
+                try:
+                    txt = open(p, encoding="utf-8", errors="replace").read()
+                except OSError:
+                    continue
+                for rx, desc in self.SINKS:
+                    if rx.search(txt):
+                        hits[desc].append(p)
+                # __destruct that calls something dangerous = candidate POP gadget
+                for m in re.finditer(
+                        r"class\s+(\w+)[^{]*\{[^}]*__destruct[^{]*\{(.*?)\}", txt, re.S):
+                    if self.GADGET_DANGER.search(m.group(2)):
+                        gadgets.append(f"{p}: class {m.group(1)}")
+        lines = []
+        for desc, ps in hits.items():
+            if ps:
+                lines.append(f"{desc}: {len(ps)} file(s) — e.g. {ps[0]}")
+        if gadgets:
+            lines.append(f"POP __destruct gadget candidates: {len(gadgets)} — e.g. {gadgets[0]}")
+        self.checks["code_sinks"] = {
+            "status": "done",
+            "detail": "\n".join(lines) or "no unserialize/LFI/gadget sinks found"}
+
+    def run(self):
+        self.ini_audit()
+        self.sink_scan()
+        return self.checks
+
+
+# ---------------------------------------------------------------- report
+
+STATUS_ZH = {
+    "ok": "通過", "info": "資訊", "done": "完成", "fail": "失敗",
+    "affected": "受影響", "patched": "已修補", "confirmed": "已確認",
+    "exposed": "已暴露", "likely_exposed": "疑似暴露",
+    "not_exposed": "未暴露", "not_confirmed": "未確認",
+    "not_triggered": "未觸發", "partial": "部分", "skip": "略過",
+    "unknown": "未知", "inconclusive": "無法判定",
+    "needs_host_check": "待主機確認",
+}
+
+CHECK_ZH = {
+    "reachable": "目標可達性",
+    "server_header": "HTTP Server 標頭",
+    "x_powered_by": "X-Powered-By 標頭",
+    "php_version": "PHP 版本指紋",
+    "sapi": "PHP SAPI 類型（mod_php 風險最高）",
+    "cve_affected": "CVE 版本判定（< 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 為受影響）",
+    "upload_progress": "session.upload_progress 無認證觸發面",
+    "session_fixation": "工作階段固定（POST body PHPSESSID 繞過 use_only_cookies）",
+    "filename_injection": "上傳檔名注入 session 儲存（Chain A 原語，修補後仍有效）",
+    "oom_trigger": "SAPI 階段 OOM 指紋（CVE-2026-109618 觸發原語；侵入式單次探測）",
+    "ini_audit": "php.ini / .user.ini 組態審計",
+    "code_sinks": "程式碼高風險 sink 掃描（unserialize / LFI / POP gadget）",
+}
+
+
+def _xesc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def write_xlsx(path, sheets):
+    """Minimal .xlsx writer (stdlib only).
+    sheets = [(name, [[row], ...]), ...] or (name, rows, widths) where
+    widths is a list of column widths in character units."""
+    import zipfile
+    ct = ('<?xml version="1.0" encoding="UTF-8"?>'
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+          '<Default Extension="xml" ContentType="application/xml"/>'
+          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>')
+    for i in range(len(sheets)):
+        ct += (f'<Override PartName="/xl/worksheets/sheet{i+1}.xml" ContentType='
+               '"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+    ct += ('<Override PartName="/xl/styles.xml" ContentType='
+           '"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>')
+    ct += '</Types>'
+    styles = ('<?xml version="1.0" encoding="UTF-8"?>'
+              '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+              '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+              '<fills count="1"><fill><patternFill/></fill></fills>'
+              '<borders count="1"><border/></borders>'
+              '<cellStyleXfs count="1"><xf/></cellStyleXfs>'
+              '<cellXfs count="2"><xf/><xf applyAlignment="1">'
+              '<alignment wrapText="1" vertical="top"/></xf></cellXfs>'
+              '</styleSheet>')
+    rels = ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '</Relationships>')
+    wb = ('<?xml version="1.0" encoding="UTF-8"?>'
+          '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>')
+    wbrels = ('<?xml version="1.0" encoding="UTF-8"?>'
+              '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">')
+    for i, sh in enumerate(sheets):
+        name = sh[0]
+        wb += f'<sheet name="{_xesc(name)}" sheetId="{i+1}" r:id="rId{i+1}"/>'
+        wbrels += (f'<Relationship Id="rId{i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+                   f'Target="worksheets/sheet{i+1}.xml"/>')
+    wbrels += ('<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+               'Target="styles.xml"/></Relationships>')
+    wb += '</sheets></workbook>'
+
+    def sheet_xml(rows, widths):
+        x = ('<?xml version="1.0" encoding="UTF-8"?>'
+             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">')
+        if widths:
+            x += '<cols>'
+            for i, w in enumerate(widths, 1):
+                x += f'<col min="{i}" max="{i}" width="{w}" customWidth="1"/>'
+            x += '</cols>'
+        x += '<sheetData>'
+        for r_i, row in enumerate(rows, 1):
+            x += f'<row r="{r_i}">'
+            for c_i, cell in enumerate(row):
+                col = ""
+                n = c_i + 1
+                while n:
+                    n, rem = divmod(n - 1, 26)
+                    col = chr(65 + rem) + col
+                x += (f'<c r="{col}{r_i}" t="inlineStr" s="1"><is><t xml:space="preserve">'
+                      f'{_xesc(cell)}</t></is></c>')
+            x += '</row>'
+        return x + '</sheetData></worksheet>'
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", ct)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("xl/workbook.xml", wb)
+        z.writestr("xl/_rels/workbook.xml.rels", wbrels)
+        z.writestr("xl/styles.xml", styles)
+        for i, sh in enumerate(sheets):
+            rows = sh[1]
+            widths = sh[2] if len(sh) > 2 else None
+            z.writestr(f"xl/worksheets/sheet{i+1}.xml",
+                       sheet_xml(rows, widths))
+
+
+def load_xlsx(path):
+    """Read back sheets written by write_xlsx → [(name, rows), ...]."""
+    import zipfile
+    z = zipfile.ZipFile(path)
+    wb = z.read("xl/workbook.xml").decode()
+    names = re.findall(r'<sheet name="([^"]*)"', wb)
+    un = (lambda s: s.replace("&quot;", '"').replace("&gt;", ">")
+          .replace("&lt;", "<").replace("&amp;", "&"))
+    sheets = []
+    for i, name in enumerate(names):
+        xml = z.read(f"xl/worksheets/sheet{i+1}.xml").decode()
+        rows = []
+        for row in re.findall(r"<row[^>]*>(.*?)</row>", xml, re.S):
+            rows.append([un(c) for c in
+                         re.findall(r"<t[^>]*>(.*?)</t>", row, re.S)])
+        sheets.append((name, rows))
+    return sheets
+
+def verdict(checks):
+    """Aggregate into an exposure assessment."""
+    out = []
+    cv = checks.get("cve_affected", {})
+    if cv.get("status") == "affected":
+        out.append("PHP version is in the affected range → CVEs applicable")
+    elif cv.get("status") == "patched":
+        out.append("PHP version is patched → core bugs fixed (Chain A primitive persists)")
+    else:
+        out.append("Version undetermined — manual check required")
+
+    exp = []
+    up = checks.get("upload_progress", {}).get("status")
+    if up == "confirmed":
+        exp.append("CONFIRMED: upload_progress accepted pre-auth session "
+                   "(sess file created on host)")
+    elif up == "likely_exposed":
+        exp.append("upload_progress reachable (both CVEs' primary trigger)")
+    fx = checks.get("session_fixation", {}).get("status")
+    if fx == "confirmed":
+        exp.append("CONFIRMED: session fixation via POST body "
+                   "(use_only_cookies bypassed)")
+    elif fx == "exposed":
+        exp.append("session fixation via POST body works")
+    fi = checks.get("filename_injection", {}).get("status")
+    if fi == "confirmed":
+        exp.append("CONFIRMED: raw filename reached session storage "
+                   "(Chain A primitive; patch-independent)")
+    elif fi == "needs_host_check":
+        exp.append("filename injection probe sent — needs host-side confirmation")
+    om = checks.get("oom_trigger", {}).get("status")
+    if om == "confirmed":
+        exp.append("CONFIRMED: SAPI-stage OOM signature "
+                   "(CVE-2026-109618 trigger primitive)")
+    if "MULTIPLE serialize_handler" in checks.get("ini_audit", {}).get("detail", ""):
+        exp.append("dual serialize_handler config present (Chain C precondition)")
+    sinks = checks.get("code_sinks", {}).get("detail", "")
+    if "no unserialize" not in sinks:
+        if "LFI sink" in sinks:
+            exp.append("application contains LFI sink(s) (Chain A precondition)")
+        if "unserialize()" in sinks:
+            exp.append("application calls unserialize() (Chain B precondition)")
+        if "gadget candidates:" in sinks:
+            exp.append("__destruct gadget candidates present (Chain C weaponization)")
+    out.append("Preconditions: " + ("; ".join(exp) if exp else "none confirmed"))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--target", help="remote target URL, e.g. http://127.0.0.1:8080/app/")
+    ap.add_argument("--path", help="local PHP project dir for code/config audit")
+    ap.add_argument("--probe-path", default="/",
+                    help="endpoint to probe (prefer one that calls session_start())")
+    ap.add_argument("--confirm", action="store_true",
+                    help="enable behavioral confirmation (benign triggers + "
+                         "host-side verification)")
+    ap.add_argument("--session-path",
+                    help="session.save_path — local dir or path on remote host "
+                         "(needed by --confirm for session file checks)")
+    ap.add_argument("--exec-cmd",
+                    help="host exec template with {cmd} placeholder, e.g. "
+                         "'docker exec php-fpm sh -c \"{cmd}\"' or 'ssh host \"{cmd}\"'")
+    ap.add_argument("--oom-mb", type=int, default=64,
+                    help="multipart body size for the mod_php OOM fingerprint "
+                         "probe (default 64MB)")
+    ap.add_argument("--json", action="store_true", help="emit JSON to stdout")
+    ap.add_argument("--output",
+                    help="report file path (default: reports/php-scan-<ts>.xlsx "
+                         "next to this script; .md/.json suffix switches format)")
+    ap.add_argument("--cookie",
+                    help="Cookie header for authenticated probes, e.g. "
+                         "'PHPSESSID=abc123; other=val' (PHPSESSID entries are "
+                         "stripped — the scanner supplies its own probe SID)")
+    ap.add_argument("--timeout", type=int, default=10)
+    args = ap.parse_args()
+
+    if not args.target and not args.path:
+        ap.error("give --target and/or --path")
+    if args.exec_cmd and not args.session_path:
+        ap.error("--exec-cmd requires --session-path (remote session dir)")
+
+    checks = {}
+    if args.target:
+        print(f"[*] Remote probe: {args.target}", file=sys.stderr)
+        host_ch = HostExec(session_path=args.session_path,
+                           exec_cmd=args.exec_cmd)
+        if args.confirm and not host_ch.available:
+            print("[!] --confirm without --session-path/--exec-cmd: "
+                  "host-side checks will be skipped", file=sys.stderr)
+        checks.update(RemoteScan(args.target, args.probe_path, args.timeout,
+                                 host=host_ch, confirm=args.confirm,
+                                 oom_mb=args.oom_mb,
+                                 cookie=args.cookie).run())
+    if args.path:
+        print(f"[*] Local audit: {args.path}", file=sys.stderr)
+        checks.update(LocalScan(args.path).run())
+
+    v = verdict(checks)
+    report = {"tool": "php-scan", "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+              "target": args.target, "path": args.path,
+              "checks": checks, "verdict": v}
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print("\n=== php-scan report ===")
+        for k, c in checks.items():
+            print(f"  [{c['status']:>16}] {k}: {c['detail']}")
+        print("\n=== verdict ===")
+        for line in v:
+            print(" *", line)
+        print("\nNote: this scanner measures exposure & prerequisites only.")
+        print("It never sends corruption payloads. 'affected' = version/config"
+              " exposure, not proof of exploitability.")
+
+    out = args.output
+    if out is None:
+        out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "reports", "php-scan-results.xlsx")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    if out.endswith(".xlsx"):
+        rows = [["掃描時間", "目標", "檢查項", "狀態", "說明", "原始細節"]]
+        for k, c in checks.items():
+            rows.append([report["time"], args.target or "-", k,
+                         STATUS_ZH.get(c["status"], c["status"]),
+                         CHECK_ZH.get(k, ""), c["detail"]])
+        vrows = [["掃描時間", "目標", "判定結論"]]
+        vrows += [[report["time"], args.target or "-", line] for line in v]
+        summary = next((x for x in v if "Preconditions" in x or
+                        "前提" in x), v[0] if v else "")
+        meta = [["掃描時間", "目標", "本地路徑", "confirm 模式", "判定摘要"],
+                [report["time"], args.target or "-", args.path or "-",
+                 "是" if args.confirm else "否", summary]]
+        if os.path.exists(out):
+            old = load_xlsx(out)
+            if len(old) == 3:
+                meta, rows, vrows = (
+                    old[0][1] + meta[1:], old[1][1] + rows[1:],
+                    old[2][1] + vrows[1:])
+        write_xlsx(out, [("掃描記錄", meta, [18, 28, 32, 12, 80]),
+                         ("檢查明細", rows, [18, 28, 20, 12, 40, 80]),
+                         ("判定", vrows, [18, 28, 110])])
+        print(f"\n[+] report appended: {out}", file=sys.stderr)
+        return
+    if out.endswith(".json"):
+        content = json.dumps(report, indent=2)
+    else:
+        lines = [f"# php-scan report — {report['time']}", "",
+                 f"- target: `{args.target or '-'}`  path: `{args.path or '-'}`",
+                 ""]
+        for k, c in checks.items():
+            lines.append(f"- **[{c['status']}] {k}** — {c['detail']}")
+        lines += ["", "## verdict", ""]
+        lines += [f"- {x}" for x in v]
+        lines += ["", "_exposure & prerequisites only; no corruption payloads sent._"]
+        content = "\n".join(lines)
+    with open(out, "w") as f:
+        f.write(content)
+    print(f"\n[+] report written: {out}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
