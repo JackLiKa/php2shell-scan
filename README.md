@@ -1,131 +1,112 @@
 # php-scan
 
-CVE-2026-109618 / CVE-2026-109619 **暴露面扫描器**（防御用途）。
+CVE-2026-109618 / CVE-2026-109619 **exposure & prerequisite scanner** —
+老 PHP 项目暴露面与前置条件扫描器。
 
-与原 `php2shell-poc` 的 exploit 不同：本工具**只探测暴露面和前置条件**，
-不发送内存破坏 payload、不 crash worker、不注入可执行代码。
+Single-file, zero-dependency (Python 3 stdlib only), **strictly
+non-destructive**: never sends memory-corruption payloads, never stalls
+connections, never injects executable code (inert markers only).
 
-## 用法
+单文件、Python 3 标准库零依赖、**严格非破坏式**：不发内存破坏
+payload、不挂起连接、不注入可执行代码（只发惰性 marker）。
 
-```bash
-# 远程黑盒探测（对授权目标）
-python3 php_scan.py --target http://127.0.0.1:18080 --probe-path /sess.php
+> ⚖️ **License / 许可 / 許可**：Personal, non-commercial use only
+> (learning, research, authorized testing). **Commercial use requires
+> written permission — contact https://github.com/JackLiKa. Unauthorized
+> commercial use will be prosecuted.** See [LICENSE](LICENSE).
+> 仅供个人学习/测试/授权环境使用；商用须联系作者取得书面授权，违者必究。
 
-# 批量：每行一个 URL，# 开头为注释
-python3 php_scan.py --targets targets.txt --confirm ...
+---
 
-# 本地代码/配置审计（有源码访问权限时）
-python3 php_scan.py --path /var/www/myapp
+## Features / 功能 / 功能
 
-# 两者结合 + JSON 输出
-python3 php_scan.py --target http://target --path ./src --json
+| Mode | What it does | 說明 |
+|---|---|---|
+| `--target` | Remote black-box probe: headers, PHP version, SAPI, session-name learning, upload_progress reachability, session fixation, filename-marker injection | 远程黑盒探测单个端点 |
+| `--targets` | Batch scan, one URL per line | 批次掃描（每行一個 URL） |
+| `--crawl` | **Same-domain recursive crawler** — BFS follows links + form actions, skips static assets & external domains, then scans every discovered page/endpoint | 同域遞歸爬取：自動發現頁面與表單接口並逐一掃描 |
+| `--path` | Local audit: ini/.htaccess configs, Dockerfile/compose image tags (version + SAPI evidence), nginx/apache confs, composer.json/lock + known POP-gadget packages, code sinks (unserialize/LFI/handler-mismatch), magic-method gadgets | 本地代碼與配置審計 |
+| `--confirm` | **Behavioral confirmation**: actually triggers benign primitives and verifies server-side (session file creation, marker in session data, mod_php "Unknown on line 0" OOM signature) via `--session-path` / `--exec-cmd` host channel | 行為確認模式：真實觸發良性原語並在主機側閉環驗證 |
 
-# 自定义报告文件（.md/.json/.xlsx 后缀自动识别）；--no-report 不落盘
-python3 php_scan.py --target http://target --output /tmp/scan.xlsx
-```
-
-每次扫描结束**自动追加到单一报告文件**：默认 `reports/php-scan-results.xlsx`
-（在脚本目录下）。Excel 报告含三个工作表（掃描記錄 / 檢查明細 / 判定），
-每行帶掃描時間、目標與嚴重度，多次掃描逐行累積便於對比；說明欄為繁體中文。
-`--output` 可覆蓋路徑與格式（.md/.json/.xlsx），`--no-report` 跳过落盘。
-
-`--probe-path` 建议指向一个会调用 `session_start()` 的端点；缺省时取
-`--target` URL 里的路径。扫描器会**自动学习 session cookie 名**
-（`session.name`，框架常改名如 `laravel_session`/`symfony`）——SID 探针
-用学到的名字发送，否则 rfc1867/upload_progress 一律假阴性。
-
-## --confirm 行为确认模式
-
-默认模式只做暴露面判定。`--confirm` 会**真实触发良性原语**并到主机侧
-闭环验证指纹，输出 `confirmed` 级判定：
+## Usage / 用法
 
 ```bash
-# 主机侧通道二选一（也可都用）
+# Remote probe of a single endpoint
+python3 php_scan.py --target https://example.com --probe-path /login
+
+# Recursive same-domain crawl + scan (skips static assets & externals)
+python3 php_scan.py --target https://example.com --crawl \
+    --crawl-depth 2 --max-pages 30
+
+# Batch from file
+python3 php_scan.py --targets targets.txt
+
+# Local source/config audit
+python3 php_scan.py --path /srv/legacy-app/
+
+# Behavioral confirmation (needs a host-side channel)
 python3 php_scan.py --target http://127.0.0.1:18080 --confirm \
     --session-path /tmp \
-    --exec-cmd 'docker exec lab-a-vuln sh -c "{cmd}"'
-# 或挂载卷场景：--session-path 直接指向本机可见的 session 目录，不需 --exec-cmd
+    --exec-cmd 'docker exec php-fpm sh -c "{cmd}"'
+
+# Authenticated scan (session cookie stripped — scanner uses its own SID)
+python3 php_scan.py --target https://example.com \
+    --cookie 'PHPSESSID=xxx; other=val' --confirm
+
+# Report control — default appends to reports/php-scan-results.xlsx
+python3 php_scan.py --target https://example.com --output out.md  # .md/.json/.xlsx
+python3 php_scan.py --target https://example.com --no-report      # stdout only
 ```
 
-带登录态扫描（后台页需要 session cookie 时）：
+## Report / 報告
 
-```bash
-python3 php_scan.py --target https://example.com --probe-path /admin/panel.php \
-    --cookie 'PHPSESSID=你的会话id; other=val' --confirm
-# 注意：cookie 里的 PHPSESSID 会被剥离——探测用自己的 SID，其余 cookie 原样带上
-```
+每次扫描自动追加到**单一 Excel 文件** `reports/php-scan-results.xlsx`，
+繁体中文、自动换行列宽，三个工作表：
 
-| 确认项 | 触发 | 指纹 | 副作用 |
-|---|---|---|---|
-| upload_progress | POST body 探测 SID | `sess_<probe>` 在主机被创建 | 生成一个探测会话文件 |
-| session fixation | 同上 | 同上（rfc1867 绕过 use_only_cookies） | 同上 |
-| filename 注入 | 文件名塞 marker 文本 | marker 原样存在于 sess 文件 | `cleanup=On` 时会被清除 → not_confirmed |
-| mod_php OOM | chunked multipart 大字段（绕 post_max_size） | `Allowed memory size ... in Unknown on line 0` | **一次 memory_limit fatal error**（单请求，不 crash worker，无堆喷射） |
+- **掃描記錄** — 时间 / 目标 / 严重度 / 判定摘要（每次扫描一行）
+- **檢查明細** — 每个检查项的状态与原始证据
+- **判定** — 每个目标的结论，带严重度
 
-OOM 探针是确认 CVE-2026-109618 触发原语的**行为指纹**：在 8.2.34 上
-复现 "Unknown on line 0"，在 8.2.35 上不触发（soft-OOM 路径）——
-这是本工具唯一的 vuln/patched 行为区分项，其余检查在两版上表现一致
-（session 注入 primitive 补丁不修）。
+Severity 严重度：`critical` / `high` / `medium` / `low` / `info`
+（affected + mod_php 或 confirmed OOM → critical；EOL 版本 → critical）
 
-判定等级：`affected`（版本）< `confirmed`（行为指纹）< `exploited`
-（真 RCE 回显——本工具不做，请在 lab 用 exploit 验证）。
+## Verdict semantics / 判定語義
 
-## 检查项
+| Status | Meaning |
+|---|---|
+| `affected` | PHP version inside the officially affected range (< 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12) — **exposure, not proof of exploitability** |
+| `eol` | EOL branch (e.g. PHP ≤ 8.1): no official patch exists |
+| `patched` | Version ≥ fixed release (Chain A filename-injection primitive persists by design — patch doesn't cover it) |
+| `confirmed` | Behavioral fingerprint verified on the host side (real trigger, real evidence) |
+| `likely_exposed` / `needs_host_check` | Trigger accepted remotely; host-side confirmation needed |
+| `resisted` / `not_triggered` / `inconclusive` | Honest negative/indeterminate states — never overclaimed |
 
-**远程**（良性探测，无副作用）
+**`affected` ≠ `exploitable`.** CVE-2026-109618 has no side-effect-free
+remote exploit-verification method; the scanner reports exposure +
+prerequisites + mitigation, never fake "RCE success".
 
-| 检查 | 方法 | 判定 |
-|---|---|---|
-| PHP 版本 | `X-Powered-By` / 响应体指纹 | < 8.2.35/8.3.36/8.4.27/8.5.12 → affected；<8.2 → eol |
-| SAPI | Server 头推断（apache→mod_php、nginx/caddy→fpm、litespeed→LSAPI） | mod_php 风险最高 |
-| session cookie 名 | `Set-Cookie` 自动学习 | 后续 SID 探针全部使用该名 |
-| upload_progress | 发送 `PHP_SESSION_UPLOAD_PROGRESS` 字段 | 被接受 → CVE 触发面开放 |
-| session fixation | POST body SID → 观察 Set-Cookie | 固定 SID 被接受 → exposed；被替换 → resisted |
-| filename 注入 | 文件名塞**标记字符串**（非代码） | 需在主机确认 sess 文件含 marker |
+`affected` ≠ 可利用——本工具输出「受影响版本 + 哪些前置条件成立 +
+缓解建议」，绝不虚报「打进去了」。
 
-**本地**（静态审计）
+## Limitations / 限制
 
-- ini 面：`php.ini` / `.user.ini` / 任意 `*.ini` / `.htaccess` 的 `php_value|php_flag`——
-  `memory_limit`、`post_max_size`、`use_only_cookies`、`save_path`、
-  `upload_progress.*`、`expose_php`、`disable_functions`、`open_basedir`、
-  `allow_url_include`
-- **版本线报**：`Dockerfile`/`docker-compose`/`compose.yml` 的 `php:X.Y.Z` 镜像 tag、
-  `composer.json` php 约束 → `cve_range_local` 本地版本判定
-- **SAPI 证据**：镜像 tag（`-apache`→mod_php、`-fpm`）、`nginx.conf` 的
-  `fastcgi_pass`、apache conf 的 `libphp/php_module`
-- `session.serialize_handler` 跨目录不一致 → `serialize_handler_conflict`
-  （Chain C 前提，high）
-- `session.upload_progress.enabled` 未显式 Off → 默认 On 计为 exposed
-- `composer.lock` 中已知 POP gadget 包（laravel/monolog/guzzle/twig/phpunit/
-  faker/swiftmailer/phpspreadsheet/doctrine/symfony）
-- 代码 sink：`unserialize()`、`include/require` 变量（LFI）、
-  `ini_set('session.serialize_handler')`、`session_set_save_handler()`
-- POP gadget：`__destruct`/`__wakeup`/`__unserialize`/`__call`/`__invoke`/
-  `__toString` 内含危险调用（区分 app/vendor）
+- `expose_php=Off` 时远程无法判版本 → 用 `--path` 或主机 `php -v` 确认
+- session 文件确认需要主机侧通道（`--session-path` / `--exec-cmd`）
+- 前置 WAF/CDN（ESA、Cloudflare 等）会拦截部分探针 → 状态如实标
+  `inconclusive`，不硬判
+- 代码 sink 扫描是 regex 级启发式，框架封装/间接调用可能漏报
+- 不检测 `fatal_error_backtraces`（PHP 8.5 arm）与 OPcache 状态
 
-## 严重度分级
+## Mitigation checklist / 緩解建議
 
-`critical` / `high` / `medium` / `low` / `info`，汇总进报告与 Excel：
+- 升级 ≥ 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12（EOL 版本必须升级，无补丁）
+- `session.upload_progress.enabled = Off`（两条链的主要触发面）
+- `session.use_only_cookies = 1`、统一 `session.serialize_handler`
+- `expose_php = Off`、审计 `unserialize()` 与动态 `include` sink
+- EOL 版本隔离 / VPN 限制访问
 
-- affected + mod_php/Apache → **critical**（厂商在 mod_php 上演示过未授权 RCE）
-- affected + fpm/其他 → high；EOL 版本（<8.2，无官方补丁）→ critical
-- patched → low（Chain A 原语是设计行为，补丁不修）
-- confirmed 级行为指纹提升严重度：OOM 指纹 → critical，session 原语确认 → high
+---
 
-## 判定语义
-
-输出的是 **"受影响版本 + 哪些前置条件成立 + 缓解建议"**，
-不是 "我打进去了"。原因：
-
-- CVE-2026-109618（OOM→内存损坏）**没有无副作用的远程探测法**，
-  可利用性判定只能靠版本号
-- Chain A 的 filename 注入 primitive **补丁不修复**（8.5.12 上仍有效），
-  单独报为 "LFI 组合风险"
-- `affected` ≠ `exploitable`，实际武器化还需要 LFI sink / POP gadget /
-  堆喷射等
-
-## 限制
-
-- `expose_php=Off` 时版本无法远程判定 → 配合 `--path` 或手工确认
-- session 文件确认需要主机侧访问（工具会打印要执行的 grep 命令）
-- 不检测 `fatal_error_backtraces`（PHP 8.5 特有 arm）和 OPcache 状态
+**For authorized security assessment only. / 仅限授权安全测试。**
+Commercial use requires written permission — contact
+https://github.com/JackLiKa. 商用请联系授权，非法必究。

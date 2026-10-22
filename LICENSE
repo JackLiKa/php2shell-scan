@@ -1,0 +1,71 @@
+php-scan — Custom License / 自定义许可 / 自定義許可
+====================================================================
+
+Copyright (c) 2026 JackLiKa. All rights reserved.
+
+English
+-------
+Permission is hereby granted, free of charge, to use this software
+("php-scan") and its documentation for PERSONAL, NON-COMMERCIAL purposes
+only, including learning, research, and authorized security testing in
+environments you own or are explicitly permitted to test.
+
+The following are expressly PROHIBITED without prior written permission
+from the copyright holder:
+
+  1. Any commercial use, including but not limited to: use in a
+     commercial product or service, use to provide paid services,
+     use inside a company's production or business operations.
+  2. Redistribution, sublicensing, or sale of this software or
+     derivative works, in whole or in part.
+  3. Removing or altering this license notice.
+
+Commercial licensing inquiries: contact the repository owner
+(https://github.com/JackLiKa) before any commercial use.
+
+Unauthorized commercial use will be prosecuted to the fullest extent
+permitted by law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+The author assumes no liability for misuse. This tool must only be
+used against systems you are authorized to test.
+
+
+中文（简体）
+------------
+特此免费授予许可：本软件（"php-scan"）及其文档仅限**个人、非商业**
+用途使用，包括学习、研究，以及在你拥有或被明确授权的环境中进行
+安全测试。
+
+未经著作权人事先书面许可，严禁以下行为：
+
+  1. 任何商业用途，包括但不限于：用于商业产品或服务、用于提供
+     收费服务、用于公司生产环境或业务运营。
+  2. 对本软件或其衍生作品的全部或部分进行再分发、再许可或出售。
+  3. 删除或修改本许可声明。
+
+商业授权请联系仓库所有者（https://github.com/JackLiKa）。
+任何未经授权的商业使用将依法追究法律责任。
+
+本软件按"原样"提供，不附带任何担保。本工具仅可用于你有权测试的
+系统，因滥用造成的一切后果由使用者自行承担。
+
+
+中文（繁體）
+------------
+特此免費授予許可：本軟體（"php-scan"）及其文件僅限**個人、非商業**
+用途使用，包括學習、研究，以及在你擁有或被明確授權的環境中進行
+安全測試。
+
+未經著作權人事先書面許可，嚴禁以下行為：
+
+  1. 任何商業用途，包括但不限於：用於商業產品或服務、用於提供
+     收費服務、用於公司生產環境或業務營運。
+  2. 對本軟體或其衍生作品之全部或部分進行再分發、再許可或出售。
+  3. 刪除或修改本許可聲明。
+
+商業授權請聯繫倉庫所有者（https://github.com/JackLiKa）。
+任何未經授權的商業使用將依法追究法律責任。
+
+本軟體按「原樣」提供，不附帶任何擔保。本工具僅可用於你有權測試的
+系統，因濫用造成之一切後果由使用者自行承擔。
