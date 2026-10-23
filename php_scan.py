@@ -333,11 +333,23 @@ class RemoteScan:
     @staticmethod
     def _resolve_loc(loc, host, port, tls):
         """Parse a Location into (host, port, tls, path). Absolute URLs may
-        point at a different host — followed once without a domain check."""
+        point at a different host — followed once without a domain check.
+        No explicit port → the SCHEME's default (a bare 'https://x/' must
+        not keep the http port)."""
         if loc.startswith(("http://", "https://")):
             u = urlparse(loc)
-            return (u.hostname or host, u.port or port,
-                    u.scheme == "https", u.path or "/")
+            new_tls = u.scheme == "https"
+            if u.port:
+                new_port = u.port
+            elif new_tls != tls:
+                # scheme flip with no port → the NEW scheme's default
+                # (bare 'https://x/' must not keep the http port)
+                new_port = 443 if new_tls else 80
+            else:
+                # same scheme, no port → keep the original (nonstandard
+                # ports like :8899 still reach the same service)
+                new_port = port
+            return (u.hostname or host, new_port, new_tls, u.path or "/")
         return host, port, tls, loc
 
     # response-body exploit signatures (ikow detection SID 2026110/2026111)
@@ -368,6 +380,7 @@ class RemoteScan:
 
     def _get(self, path, cookie=None):
         host, port, tls = self.host, self.port, self.tls
+        self._redirected = None
         resp = None
         for _ in range(2):  # original request + one redirect follow
             req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n" + BASE_HEADERS
@@ -394,8 +407,12 @@ class RemoteScan:
         body += (f"--{b}\r\nContent-Disposition: form-data; name=\"f\"; "
                  f'filename="{filename}"\r\n\r\nZ\r\n--{b}--\r\n').encode("latin-1")
         host, port, tls = self.host, self.port, self.tls
+        self._redirected = None
         resp = None
         for _ in range(2):  # original request + one redirect follow
+            # note: a cross-host Location forwards the user's --cookie
+            # (incl. auth cookies) to the new host — Location is target-
+            # controlled; documented, not blocked
             req = (f"{method} {path} HTTP/1.1\r\nHost: {host}\r\n"
                    + BASE_HEADERS
                    + f"Content-Type: multipart/form-data; boundary={b}\r\n"
