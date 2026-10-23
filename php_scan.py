@@ -40,12 +40,14 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import ssl
 import subprocess
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, urljoin
 
 FIXED = {2: 35, 3: 36, 4: 27, 5: 12}   # PHP 8.X must be >= 8.X.FIXED[X]
@@ -65,6 +67,10 @@ def version_state(ver):
         return "unknown", f"version not disclosed; verify manually against {FIXED_STR}"
     major, minor = ver[0], ver[1]
     patch = ver[2] if len(ver) > 2 else 0
+    if major < 5 or (major == 5 and minor < 4):
+        return "not_applicable", (
+            f"PHP {major}.{minor}.{patch} predates session.upload_progress "
+            "(introduced in 5.4) — outside both CVEs' range")
     if major < 8 or (major == 8 and minor < 2):
         return "eol", (f"PHP {major}.{minor}.{patch} is EOL — no official fix; "
                        "upgrade required (or isolate + upload_progress=Off)")
@@ -177,6 +183,10 @@ class HostExec:
         out = self._run(f"test -f {shlex.quote(p)} && echo YES || echo NO")
         return bool(out and "YES" in out)
 
+    def out(self, cmd):
+        """Run a read-only command on the host, return combined output."""
+        return self._run(cmd)
+
     def file_contains(self, name, needle):
         p = self._path(name)
         if self.session_path and not self.exec_cmd:
@@ -287,7 +297,8 @@ def crawl_site(target, cookie=None, max_pages=50, max_depth=3, timeout=10):
 
 class RemoteScan:
     def __init__(self, target, path="/", timeout=10, host=None, confirm=False,
-                 oom_mb=64, cookie=None, force_oom=False):
+                 oom_mb=64, cookie=None, force_oom=False, oom_strategy="auto",
+                 progress_name="PHP_SESSION_UPLOAD_PROGRESS"):
         u = urlparse(target if "://" in target else "http://" + target)
         self.host = u.hostname
         self.tls = u.scheme == "https"
@@ -303,7 +314,27 @@ class RemoteScan:
         self._sess_name = "PHPSESSID"   # refined by fingerprint() from Set-Cookie
         self._sapi = "unknown"
         self.force_oom = force_oom
+        self.oom_strategy = oom_strategy
+        self.progress_name = progress_name   # session.upload_progress.name
+        self._sid_leak = None           # anomalous session Set-Cookie (heap leak sig)
+        self._iocs = []                 # exploit signatures seen in responses
         self.checks = {}
+
+    # response-body exploit signatures (ikow detection SID 2026110/2026111)
+    RESPONSE_IOCS = [
+        (re.compile(rb"Session object destruction failed"),
+         "'Session object destruction failed' — stale BG(unserialize) state "
+         "consumed during rfc1867 (CVE-2026-109619 exploitation signature)"),
+        (re.compile(rb"Allowed memory size.{0,200}in\s*<?b?>?\s*Unknown",
+                    re.S),
+         "'Allowed memory size … in Unknown on line 0' — OOM fired during "
+         "SAPI/request startup, not userland code"),
+    ]
+
+    def _scan_body_iocs(self, body):
+        for rx, desc in self.RESPONSE_IOCS:
+            if rx.search(body) and desc not in self._iocs:
+                self._iocs.append(desc)
 
     @staticmethod
     def _strip_sid(cookie):
@@ -319,9 +350,12 @@ class RemoteScan:
         req = (f"GET {path} HTTP/1.1\r\nHost: {self.host}\r\n" + BASE_HEADERS
                + self._cookie_line(cookie)
                + "Connection: close\r\n\r\n").encode()
-        return http(self.host, self.port, req, tls=self.tls, timeout=self.timeout)
+        resp = http(self.host, self.port, req, tls=self.tls, timeout=self.timeout)
+        if resp:
+            self._scan_body_iocs(resp.partition(b"\r\n\r\n")[2])
+        return resp
 
-    def _upload(self, path, fields, filename="probe.txt"):
+    def _upload(self, path, fields, filename="probe.txt", method="POST"):
         b = "PHPSCAN" + uuid.uuid4().hex[:8]
         body = b""
         for n, v in fields.items():
@@ -329,12 +363,15 @@ class RemoteScan:
                      f'name="{n}"\r\n\r\n{v}\r\n').encode("latin-1")
         body += (f"--{b}\r\nContent-Disposition: form-data; name=\"f\"; "
                  f'filename="{filename}"\r\n\r\nZ\r\n--{b}--\r\n').encode("latin-1")
-        req = (f"POST {path} HTTP/1.1\r\nHost: {self.host}\r\n" + BASE_HEADERS
+        req = (f"{method} {path} HTTP/1.1\r\nHost: {self.host}\r\n" + BASE_HEADERS
                + f"Content-Type: multipart/form-data; boundary={b}\r\n"
                + self._cookie_line()
                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
                ).encode() + body
-        return http(self.host, self.port, req, tls=self.tls, timeout=self.timeout)
+        resp = http(self.host, self.port, req, tls=self.tls, timeout=self.timeout)
+        if resp:
+            self._scan_body_iocs(resp.partition(b"\r\n\r\n")[2])
+        return resp
 
     def fingerprint(self):
         resp = self._get(self.probe_path)
@@ -368,68 +405,203 @@ class RemoteScan:
                 "status": "info",
                 "detail": f"no session-like cookie ({', '.join(cookies)} are "
                           "WAF/CDN cookies) — SID probes use PHPSESSID fallback"}
-        # version from header or phpinfo-style body
-        ver = None
-        src = (powered.group(1) if powered else "") + " " + body.decode("latin1", "replace")
-        m = re.search(r"PHP[/ ]?(\d+)\.(\d+)\.(\d+)", src)
-        if m:
-            ver = tuple(int(x) for x in m.groups())
-        self.checks["php_version"] = (
-            {"status": "ok", "detail": ".".join(map(str, ver))} if ver
-            else {"status": "unknown", "detail": "not disclosed (expose_php may be Off)"})
+        # version: collect EVERY "PHP/x.y.z" mention across X-Powered-By,
+        # Server, and body, then keep the WORST verdict (phpcheck.js
+        # strategy — a reassuring banner must not mask a vulnerable build).
+        # Prerelease builds (dev/alpha/beta/rc) are never trusted → unknown.
+        RANK = {"affected": 5, "eol": 4, "unknown": 3, "patched": 2,
+                "not_applicable": 1}
+        cands = []
+        for label, src in (("x-powered-by", powered.group(1) if powered else ""),
+                           ("server", server.group(1) if server else ""),
+                           ("body", body.decode("latin1", "replace"))):
+            for m in re.finditer(r"PHP[/ ]?(\d+)\.(\d+)\.(\d+)([^\s,;)]*)", src):
+                v = tuple(int(x) for x in m.groups()[:3])
+                pre = bool(re.search(r"dev|alpha|beta|rc", m.group(4), re.I))
+                st = "unknown" if pre else version_state(v)[0]
+                cands.append((v, label, pre, st))
+        ver = ver_src = None
+        if cands:
+            v, label, pre, st = max(
+                cands, key=lambda c: (RANK[c[3]], c[0][2]))
+            ver = v
+            self._ver_pre = pre
+            ver_src = label + (" (prerelease build — not judged)" if pre else "")
+            detail = ".".join(map(str, ver)) + f" [from {ver_src}]"
+            if len(cands) > 1:
+                detail += ("; other PHP versions also advertised: " +
+                           ", ".join(".".join(map(str, c[0])) + f" ({c[1]})"
+                                     for c in cands if c[0] != v or c[1] != label))
+            detail += " — banners cannot rule out a backported fix"
+            self.checks["php_version"] = {"status": "ok", "detail": detail}
+        else:
+            self.checks["php_version"] = {
+                "status": "unknown",
+                "detail": "not disclosed (expose_php may be Off)"}
         self._ver = ver
+        # edge WAF/CDN note — explains filtered probes / dropped chunked bodies
+        sh_raw = (server.group(1) if server else "")
+        waf = next((w for w in ("cloudflare", "akamai", "awselb", "sucuri",
+                                "imperva", "azion", "fastly")
+                    if w in sh_raw.lower()), None)
+        via = re.search(r"Via:\s*([^\r\n]+)", head, re.I)
+        if waf or via:
+            self.checks["edge_waf"] = {
+                "status": "info",
+                "detail": f"edge layer detected ({waf or via.group(1).strip()}) — "
+                          "multipart/chunked probes may be filtered; "
+                          "inconclusive results should be retried from inside"}
         # SAPI guess — heuristic only
         sh = (server.group(1) if server else "").lower()
         if "apache" in sh and powered and "PHP" in powered.group(1):
             self._sapi = "likely mod_php (Apache + PHP header)"
+        elif "frankenphp" in sh or ("caddy" in sh and powered and "PHP" in powered.group(1)):
+            self._sapi = "FrankenPHP embedded SAPI"
         elif "nginx" in sh or "caddy" in sh:
             self._sapi = "likely php-fpm / fastcgi"
-        elif "litespeed" in sh:
+        elif "lighttpd" in sh:
+            self._sapi = "lighttpd fastcgi (likely php-fpm)"
+        elif "litespeed" in sh or "openlitespeed" in sh:
             self._sapi = "LiteSpeed LSAPI (lsphp)"
+        elif "unit" in sh:
+            self._sapi = "NGINX Unit embedded SAPI"
         if b"fpm-fcgi" in body.lower():
             self._sapi = "php-fpm"
         self.checks["sapi"] = {"status": "info", "detail": self._sapi}
         return True
 
     def version_verdict(self):
-        st, det = version_state(self._ver)
+        if getattr(self, "_ver_pre", False):
+            st, det = ("unknown", "prerelease build (dev/alpha/beta/rc) — "
+                                 "cannot be judged against release boundaries")
+        else:
+            st, det = version_state(self._ver)
         self.checks["cve_affected"] = {"status": st, "detail": det}
+
+    def _sid_anomaly(self, head):
+        """Anomalous session-id Set-Cookie → heap leak signature.
+
+        Normal PHP session ids are 26–40 chars of [-,\\w]. A value >=64
+        chars or containing url-encoded/binary bytes means uninitialized
+        memory is being disclosed through the cookie — the CVE-2026-109618
+        stage-1 leak primitive (Sansec IDS SID 2026112)."""
+        m = re.search(r"Set-Cookie:\s*" + re.escape(self._sess_name) +
+                      r"=([^;\r\n]*)", head, re.I)
+        if not m:
+            return None
+        val = m.group(1).strip()
+        if len(val) >= 64 or not re.fullmatch(r"[A-Za-z0-9,\-]{1,48}", val):
+            return val
+        return None
+
+    def display_errors_probe(self):
+        """Benign: exceed max_input_vars with a GET and look for a PHP warning.
+
+        display_errors=On prints 'PHP Warning: ... max_input_vars ...' into
+        the body — that setting is what makes the display_errors-dependent
+        leak path (9bie stage-1/2 variant) work; display_errors=Off limits
+        remote fingerprints to crash signatures only."""
+        path = self.probe_path
+        sep = "&" if "?" in path else "?"
+        q = sep + "&".join(f"p{i}=v" for i in range(1100))
+        resp = self._get(path + q)
+        if not resp:
+            self.checks["display_errors"] = {"status": "unknown",
+                                             "detail": "no response"}
+            return
+        body = resp.partition(b"\r\n\r\n")[2]
+        if re.search(rb"max_input_vars|PHP Warning|PHP Fatal error|"
+                     rb"Allowed memory size", body):
+            self.checks["display_errors"] = {
+                "status": "info",
+                "detail": "PHP runtime warnings/errors are reflected in the "
+                          "response — display_errors=On: the leak-based "
+                          "exploit path is easier (and error output aids "
+                          "fingerprinting); production should run Off"}
+        else:
+            self.checks["display_errors"] = {
+                "status": "info",
+                "detail": "no PHP warning echoed for >max_input_vars input — "
+                          "display_errors likely Off (exploitation still "
+                          "possible via crash-only path, cf. 9bie "
+                          "no-display-errors notes)"}
 
     def upload_progress_probe(self, sid):
         """Benign: send PHP_SESSION_UPLOAD_PROGRESS with a probe SID via POST body.
-        upload_progress accepts the SID without auth; we then test whether the
-        fixated SID is honored on a follow-up request (session fixation)."""
+
+        upload_progress runs inside rfc1867 pre-RINIT — the endpoint does NOT
+        need session_start() for this to fire. Two remote signals:
+          1. a session Set-Cookie on the multipart response → the handler ran
+          2. Set-Cookie echoing OUR sid → POST-body fixation accepted
+             (pre-PR#22113), confirmed without any host channel."""
+        self._fixation = None
+        method = "POST"
         resp = self._upload(self.probe_path,
                             {self._sess_name: sid,
-                             "PHP_SESSION_UPLOAD_PROGRESS": "x"})
+                             self.progress_name: "x"})
+        if resp and not re.search(rb"HTTP/1\.\d\s+(200|30[0-9])",
+                                  resp.split(b"\r\n", 1)[0]):
+            # POST didn't take — PHP 8.4's request_parse_body() parses
+            # multipart on PUT/PATCH/DELETE too; a PUT retry both reaches
+            # the handler and detects the widened surface
+            resp = self._upload(self.probe_path,
+                                {self._sess_name: sid,
+                                 self.progress_name: "x"}, method="PUT")
+            if resp and re.search(rb"HTTP/1\.\d\s+(200|30[0-9])",
+                                  resp.split(b"\r\n", 1)[0]):
+                method = "PUT"
         if not resp:
             self.checks["upload_progress"] = {"status": "unknown", "detail": "no response"}
             return
         head, _ = split(resp)
+        leak = self._sid_anomaly(head)
+        if leak:
+            self._sid_leak = leak
         ok = " 200" in head.split("\r\n", 1)[0] or " 302" in head.split("\r\n", 1)[0]
+        via = (" via PUT — request_parse_body() non-POST multipart surface "
+               "accepted (PHP 8.4+); POST-only WAF rules bypassable"
+               if method == "PUT" and ok else "")
         # upload_progress rejecting requests usually produces a PHP warning/error
         rejected = b"upload_progress" in resp.lower() and b"disabled" in resp.lower()
+        # Set-Cookie analysis: did the rfc1867 handler start a session, and did
+        # it adopt our POST-body SID?
+        sc = re.search(r"Set-Cookie:\s*" + re.escape(self._sess_name) +
+                       r"=([^;\r\n]*)", head, re.I)
+        sc_val = sc.group(1).strip() if sc else None
+        if sc_val == sid:
+            self._fixation = "confirmed"
+        elif sc_val:
+            self._fixation = "resisted"
         if rejected:
             self.checks["upload_progress"] = {
                 "status": "not_exposed", "detail": "server reports feature disabled"}
         elif ok:
+            extra = ("; Set-Cookie echoes probe SID → POST-body fixation "
+                     "confirmed remotely" if self._fixation == "confirmed"
+                     else "; session cookie issued but SID regenerated"
+                     if self._fixation == "resisted" else "")
             if self.confirm and self.host_ch.available:
                 if self.host_ch.file_exists(f"sess_{sid}"):
                     self.checks["upload_progress"] = {
                         "status": "confirmed",
                         "detail": f"sess_{sid} created on host — upload_progress "
                                   "accepted a session id from POST body (pre-auth)"}
-                    self._fixation_confirmed = True
+                    self._fixation = "confirmed"
                     return
                 self.checks["upload_progress"] = {
-                    "status": "not_confirmed",
-                    "detail": f"200 OK but no sess_{sid} found via host channel — "
-                              "check session.save_path matches --session-path"}
+                    "status": "confirmed" if self._fixation == "confirmed"
+                              else "not_confirmed",
+                    "detail": (f"session issued via rfc1867{extra}"
+                               if self._fixation else
+                               f"200 OK but no sess_{sid} found via host channel — "
+                               "check session.save_path matches --session-path")}
             else:
                 self.checks["upload_progress"] = {
-                    "status": "likely_exposed",
-                    "detail": "multipart with PHP_SESSION_UPLOAD_PROGRESS accepted "
-                              "(confirm on host: check sess_" + sid + ")"}
+                    "status": "confirmed" if self._fixation == "confirmed"
+                              else "likely_exposed",
+                    "detail": (f"multipart with {self.progress_name} accepted"
+                               + via + extra +
+                               " (confirm on host: check sess_" + sid + ")")}
         else:
             self.checks["upload_progress"] = {"status": "unknown",
                                               "detail": head.split("\r\n", 1)[0]}
@@ -438,11 +610,13 @@ class RemoteScan:
         """Send PHPSESSID in POST body, then GET with that SID as cookie.
         If the app/endpoint starts a session and honors the fixated SID
         (no replacement Set-Cookie), fixation via POST body is viable."""
-        if getattr(self, "_fixation_confirmed", False):
+        fx = getattr(self, "_fixation", None)
+        if fx == "confirmed":
             self.checks["session_fixation"] = {
                 "status": "confirmed",
-                "detail": "session file created for POST-body SID — use_only_cookies "
-                          "bypassed by rfc1867 handler"}
+                "detail": "server adopted the POST-body SID (Set-Cookie echo and/or "
+                          "sess file on host) — use_only_cookies bypassed by the "
+                          "rfc1867 handler (pre-PR#22113)"}
             return
         resp = self._get(self.probe_path, cookie=f"{self._sess_name}={sid}")
         head, _ = split(resp)
@@ -468,8 +642,19 @@ class RemoteScan:
         marker = "phpscan_marker_" + uuid.uuid4().hex[:12]
         sid = "phpscanfi" + uuid.uuid4().hex[:18]
         self._upload(self.probe_path,
-                     {self._sess_name: sid, "PHP_SESSION_UPLOAD_PROGRESS": "x"},
+                     {self._sess_name: sid, self.progress_name: "x"},
                      filename=marker)
+        # remote-only signal: some endpoints reflect session/upload-progress
+        # data back (progress bars, debug output) — if the marker comes back
+        # verbatim, injection is confirmed without any host channel.
+        resp = self._get(self.probe_path, cookie=f"{self._sess_name}={sid}")
+        if resp and marker.encode() in resp.partition(b"\r\n\r\n")[2]:
+            self.checks["filename_injection"] = {
+                "status": "confirmed",
+                "detail": f"marker '{marker}' reflected verbatim by the "
+                          "endpoint — raw filename reached session/upload "
+                          "state (Chain A primitive; NOT fixed by the CVE patch)"}
+            return
         if self.confirm and self.host_ch.available:
             if self.host_ch.file_contains(f"sess_{sid}", marker):
                 self.checks["filename_injection"] = {
@@ -493,33 +678,58 @@ class RemoteScan:
                       "— if present, raw filenames reach session storage "
                       "(Chain A primitive; NOT fixed by the CVE patch)"}
 
-    def oom_probe(self):
-        """Confirm the CVE-2026-109618 trigger primitive on mod_php:
-        a single oversized multipart field forces OOM during SAPI body
-        parsing — signature is 'Allowed memory size ... in Unknown on line 0'.
+    # ------------------------------------------------------------ OOM senders
+    # Three documented CVE-2026-109618 OOM strategies (advisory GHSA-
+    # w8hw-w9fx-j79w / ikow verify_oom_trigger.py):
+    #   chunked — no Content-Length → post_max_size bypass, unbounded body
+    #   headers — thousands of part headers → ~3-5x memory amplification
+    #   nested  — empty file controls with a[b][c]... names → nested-array
+    #             multiplication; doesn't count toward max_file_uploads
+    # chunked is strongest but edge/WAFs often drop it; the other two are
+    # small bounded requests that usually get through.
 
-        INTRUSIVE: causes one memory_limit fatal error in a worker.
-        Does NOT attempt corruption — no heap spray, single request only."""
-        boundary = "PHPSCANOOM" + uuid.uuid4().hex[:8]
-        head_part = (f"--{boundary}\r\n"
-                     f'Content-Disposition: form-data; name="phpscan_data"\r\n\r\n'
-                     ).encode()
-        tail = f"\r\n--{boundary}--\r\n".encode()
-        total = self.oom_mb * 1024 * 1024
-        # Chunked encoding: no Content-Length → bypasses post_max_size
-        # (documented OOM strategy in GHSA-w8hw-w9fx-j79w)
-        req = (f"POST {self.probe_path} HTTP/1.1\r\nHost: {self.host}\r\n"
-               + BASE_HEADERS +
-               f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
-               + self._cookie_line()
-               + f"Transfer-Encoding: chunked\r\n"
-               f"Connection: close\r\n\r\n").encode()
+    def _oom_sock(self):
         s = socket.create_connection((self.host, self.port), timeout=30)
         if self.tls:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             s = ctx.wrap_socket(s, server_hostname=self.host)
+        return s
+
+    @staticmethod
+    def _oom_recv(s):
+        s.settimeout(30)
+        resp = b""
+        try:
+            while True:
+                d = s.recv(65536)
+                if not d:
+                    break
+                resp += d
+                if len(resp) > 1 << 20:
+                    break
+        except (socket.timeout, ConnectionResetError, ssl.SSLError, OSError):
+            pass
+        s.close()
+        return resp
+
+    def _oom_send_chunked(self):
+        """Unbounded body via chunked encoding. Returns (resp, sent_mb)
+        or (None, sent_mb) when the connection was cut mid-upload."""
+        boundary = "PHPSCANOOM" + uuid.uuid4().hex[:8]
+        head_part = (f"--{boundary}\r\n"
+                     f'Content-Disposition: form-data; name="phpscan_data"\r\n\r\n'
+                     ).encode()
+        tail = f"\r\n--{boundary}--\r\n".encode()
+        total = self.oom_mb * 1024 * 1024
+        req = (f"POST {self.probe_path} HTTP/1.1\r\nHost: {self.host}\r\n"
+               + BASE_HEADERS +
+               f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+               + self._cookie_line()
+               + f"Transfer-Encoding: chunked\r\n"
+               f"Connection: close\r\n\r\n").encode()
+        s = self._oom_sock()
 
         def ch(d):
             s.sendall(f"{len(d):x}\r\n".encode() + d + b"\r\n")
@@ -536,49 +746,191 @@ class RemoteScan:
             ch(tail)
             s.sendall(b"0\r\n\r\n")
         except (BrokenPipeError, ConnectionResetError, socket.timeout,
-                ssl.SSLError, OSError) as e:
+                ssl.SSLError, OSError):
             s.close()
+            return None, sent >> 20
+        return self._oom_recv(s), sent >> 20
+
+    def _oom_send_headers(self):
+        """Header amplification: one part with N oversized headers.
+        PHP stores each as zend_string + HashTable bucket (~3-5x wire)."""
+        boundary = "PHPSCANHDR" + uuid.uuid4().hex[:8]
+        # wire bytes ≈ oom_mb/4 → est. PHP memory ≈ oom_mb
+        wire = max(2, self.oom_mb // 4) * 1024 * 1024
+        hsz = 500
+        num = min(20000, max(200, wire // (hsz + 24)))
+        part = (f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="f"; filename="a"\r\n'
+                + "".join(f"X-Pad-{i}: {'A' * hsz}\r\n" for i in range(num))
+                + f"\r\nZ\r\n--{boundary}--\r\n")
+        body = part.encode()
+        req = (f"POST {self.probe_path} HTTP/1.1\r\nHost: {self.host}\r\n"
+               + BASE_HEADERS +
+               f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+               + self._cookie_line()
+               + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+               ).encode() + body
+        try:
+            s = self._oom_sock()
+            s.sendall(req)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout,
+                ssl.SSLError, OSError):
+            try:
+                s.close()
+            except OSError:
+                pass
+            return None
+        return self._oom_recv(s)
+
+    def _oom_send_nested(self):
+        """Empty file controls with deeply nested names — nested-array
+        multiplication (empty controls skip max_file_uploads)."""
+        boundary = "PHPSCANNST" + uuid.uuid4().hex[:8]
+        depth = 60
+        # each part ≈ depth nested arrays ≈ depth*300B of PHP memory
+        width = min(5000, max(50, (self.oom_mb * 1024 * 1024) // (depth * 300)))
+        nested = "f" + "[x]" * depth
+        parts = "".join(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{nested}[{i}]"; '
+            f'filename=""\r\nContent-Type: application/octet-stream\r\n\r\n\r\n'
+            for i in range(width))
+        body = (parts + f"--{boundary}--\r\n").encode()
+        req = (f"POST {self.probe_path} HTTP/1.1\r\nHost: {self.host}\r\n"
+               + BASE_HEADERS +
+               f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+               + self._cookie_line()
+               + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+               ).encode() + body
+        try:
+            s = self._oom_sock()
+            s.sendall(req)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout,
+                ssl.SSLError, OSError):
+            try:
+                s.close()
+            except OSError:
+                pass
+            return None
+        return self._oom_recv(s)
+
+    def oom_probe(self):
+        """Confirm the CVE-2026-109618 trigger primitive on mod_php:
+        force OOM during SAPI body parsing — signature is 'Allowed memory
+        size ... in Unknown on line 0'.
+
+        INTRUSIVE: causes memory_limit fatal errors in a worker.
+        Does NOT attempt corruption — no heap spray, one request per
+        strategy only."""
+        strategies = {
+            "chunked": self._oom_send_chunked,
+            "headers": lambda: (self._oom_send_headers(), 0),
+            "nested": lambda: (self._oom_send_nested(), 0),
+        }
+        order = (["chunked", "headers", "nested"]
+                 if self.oom_strategy == "auto"
+                 else [self.oom_strategy])
+        resp, used, sent_mb = b"", None, 0
+        fails = []
+        for name in order:
+            r, sent_mb = strategies[name]()
+            if r is not None:
+                resp, used = r, name
+                break
+            fails.append(name)
+        if used is None:
             self.checks["oom_trigger"] = {
                 "status": "inconclusive",
-                "detail": f"connection cut mid-upload after {sent >> 20}MB "
-                          f"({type(e).__name__}) — edge/WAF likely dropped the "
-                          "chunked body; OOM fingerprint not testable remotely"}
+                "detail": f"connection cut mid-upload for all strategies "
+                          f"({', '.join(order)}; ~{sent_mb}MB sent before drop) "
+                          "— edge/WAF likely dropped the body; OOM fingerprint "
+                          "not testable remotely"}
             return
-        s.settimeout(30)
-        resp = b""
+
+        leak = self._sid_anomaly(split(resp)[0] if resp else "")
+        if leak:
+            self._sid_leak = leak
+
+        # Differential signals (display_errors=Off hides the fatal string, so
+        # crash behavior is the fingerprint — cf. 9bie no-display-errors notes):
+        #   patched   → graceful OOM error page, or hard-OOM worker _exit(137)
+        #               (clean 500/connection close, next request healthy)
+        #   unpatched → stale EG()/BG() → worker abort: connection reset,
+        #               empty 500, upstream 502, and/or next request fails
+        status_line_txt = status_line(resp) if resp else ""
+        m500 = re.search(r"HTTP/1\.\d\s+(\d+)", status_line_txt)
+        code = int(m500.group(1)) if m500 else 0
+        nbody = len(resp.partition(b"\r\n\r\n")[2]) if resp else 0
+
+        # post-OOM liveness: is the worker/pool still serving?
+        time.sleep(0.4)
         try:
-            while True:
-                d = s.recv(65536)
-                if not d:
-                    break
-                resp += d
-                if len(resp) > 1 << 20:
-                    break
-        except (socket.timeout, ConnectionResetError, ssl.SSLError, OSError):
-            pass
-        s.close()
+            live = bool(self._get(self.probe_path))
+        except OSError:
+            live = False
 
         body = resp.decode("latin1", "replace")
         oom = "Allowed memory size" in body
         sapi_scope = re.search(r"in\s*<?b?>?\s*Unknown", body) is not None
+        crash_sig = ((not resp) or code == 502 or (code == 500 and nbody == 0))
+        strat = f" (strategy: {used}" + (f" — earlier tries cut: {', '.join(fails)}"
+                                        if fails else "") + ")"
         if oom and sapi_scope:
             self.checks["oom_trigger"] = {
                 "status": "confirmed",
                 "detail": "OOM during SAPI multipart parsing observed "
                           "('in Unknown on line 0') — CVE-2026-109618 trigger "
                           "primitive present. Exploitation further requires "
-                          "heap control; this probe does not attempt it."}
+                          "heap control; this probe does not attempt it."
+                          + strat}
         elif oom:
+            # On PHP 8.2+ the patch rewrote OOM handling: delayed OOM fires
+            # at a VM safe point → the error names a real file/line, while
+            # the unpatched longjmp produces "in Unknown on line 0".
+            # Pre-8.x there IS no delayed-OOM machinery — a concrete-location
+            # fatal is just a normal memory_limit error, not patch evidence.
+            pre8 = self._ver and self._ver[0] < 8
+            loc = re.search(r"in\s+(/\S+|[A-Za-z]:\\\S+|\S+\.php)\s+on line",
+                            body)
+            if pre8:
+                st, why = "partial", ("OOM fatal at a concrete location — on "
+                                      "PHP <8 this is an ordinary memory_limit "
+                                      "fatal (no delayed-OOM machinery exists); "
+                                      "EOL branch has no patched shape to "
+                                      "compare against")
+            elif loc:
+                st, why = "likely_patched", (
+                    "OOM fatal fired pointing at a concrete code location — "
+                    "consistent with the PATCHED delayed-OOM path "
+                    "(zend_handle_delayed_oom at a VM safe point); the "
+                    "unpatched longjmp produces 'in Unknown on line 0'")
+            else:
+                st, why = "partial", ("OOM fatal fired but in user code scope "
+                                      "— primitive not confirmed at SAPI stage")
+            self.checks["oom_trigger"] = {"status": st,
+                                          "detail": why + strat}
+        elif crash_sig and not live:
+            self.checks["oom_trigger"] = {
+                "status": "crash_signature",
+                "detail": f"OOM probe → {status_line_txt or 'connection cut'}"
+                          " and the target is not serving afterwards — worker "
+                          "crash consistent with unpatched stale-EG()/BG() "
+                          "behavior (patched PHP exits cleanly and recovers)"
+                          + strat}
+        elif crash_sig:
             self.checks["oom_trigger"] = {
                 "status": "partial",
-                "detail": "OOM fatal fired but in user code scope — primitive "
-                          "not confirmed at SAPI stage"}
+                "detail": f"OOM probe → {status_line_txt or 'connection cut'} "
+                          "(crash-shaped response) but the worker recovered — "
+                          "could be patched hard-OOM _exit(137); inconclusive"
+                          + strat}
         elif resp:
-            status = resp.split(b"\r\n", 1)[0].decode("latin1", "replace")
             self.checks["oom_trigger"] = {
                 "status": "not_triggered",
-                "detail": f"{status} — memory_limit not reached with "
-                          f"{self.oom_mb}MB (try --oom-mb larger)"}
+                "detail": f"{status_line_txt}{strat} — memory_limit not "
+                          f"reached with {self.oom_mb}MB (try --oom-mb "
+                          "larger); note display_errors=Off also hides the "
+                          "OOM fingerprint"}
         else:
             self.checks["oom_trigger"] = {"status": "unknown",
                                           "detail": "no response"}
@@ -592,6 +944,53 @@ class RemoteScan:
                 "detail": "mod_php: CVE-2026-109618 pre-auth RCE demonstrated "
                           "by vendor; treat an 'affected' version as critical"}
 
+    def host_patch_probe(self):
+        """Ground truth from the target host (--exec-cmd only): the web SAPI
+        banner can be stale (workers not restarted) or hide a backport, so
+        ask the host what php binary and distro packages it ACTUALLY runs
+        and compare against vendor-fixed revisions (phpcheck-server)."""
+        if not self.host_ch.exec_cmd:
+            return
+        out = self.host_ch.out(
+            "(php -v || php-fpm -v || php-cgi -v) 2>/dev/null; "
+            "cat /etc/os-release 2>/dev/null; "
+            "dpkg-query -W -f='${Package} ${Version}\\n' 'php*' 2>/dev/null || "
+            "rpm -qa 'php*' --queryformat '%{NAME} %{VERSION}-%{RELEASE}\\n' "
+            "2>/dev/null")
+        if not out or out.startswith("__exec_error"):
+            self.checks["host_patch_status"] = {
+                "status": "unknown",
+                "detail": "host command produced no usable output"}
+            return
+        # worst-of every PHP version the host reports
+        vers = {tuple(int(x) for x in m.groups())
+                for m in re.finditer(r"PHP[/ ]?(\d+)\.(\d+)\.(\d+)", out)}
+        st, det = ("unknown", "no PHP version reported by host")
+        if vers:
+            RANK = {"affected": 5, "eol": 4, "unknown": 3, "patched": 2,
+                    "not_applicable": 1}
+            st, det = max((version_state(v) for v in vers),
+                          key=lambda t: RANK[t[0]])
+            det += f" (host binary: {max(vers)})"
+        # distro package comparison against vendor-fixed revisions
+        osid = re.search(r"^ID=([\w.-]+)", out, re.M)
+        osver = re.search(r"^VERSION_ID=\"?([\w.]+)", out, re.M)
+        osid = osid.group(1).strip('"').lower() if osid else ""
+        osver = osver.group(1) if osver else ""
+        pkgnote = ""
+        for did, dver, rx, fixed, adv in VENDOR_FIXED:
+            if did == osid and osver.startswith(dver):
+                m = re.search(rf"^({rx}[^\s]*)\s+(\S+)", out, re.M)
+                if m:
+                    pkgnote += (f"; {m.group(1)} {m.group(2)} vs vendor-fixed "
+                                f"{fixed} ({adv}) — verify with "
+                                f"{'dpkg --compare-versions' if did in ('debian','ubuntu') else 'rpmdev-vercmp'}")
+        self.checks["host_patch_status"] = {
+            "status": st,
+            "detail": det + pkgnote +
+                      " — host-side values are authoritative over HTTP banners "
+                      "(workers may serve an older cached build)"}
+
     def run(self):
         if not self.fingerprint():
             return self.checks
@@ -601,6 +1000,20 @@ class RemoteScan:
         self.upload_progress_probe(sid)
         self.session_fixation_probe(sid)
         self.filename_injection_probe()
+        self.display_errors_probe()
+        if self._iocs:
+            self.checks["response_iocs"] = {
+                "status": "exposed",
+                "detail": "\n".join(self._iocs)}
+        self.host_patch_probe()
+        if self._sid_leak:
+            self.checks["sid_leak"] = {
+                "status": "leak_signature",
+                "detail": "anomalous session-id in Set-Cookie "
+                          f"({self._sid_leak if isinstance(self._sid_leak, str) else 'non-printable/oversized'})"
+                          " — heap memory disclosed through the cookie, the "
+                          "CVE-2026-109618 stage-1 leak primitive (Sansec "
+                          "detection SID 2026112)"}
         if self.confirm:
             if "mod_php" in self._sapi or self.force_oom or \
                     self.checks.get("cve_affected", {}).get("status") in (
@@ -611,6 +1024,7 @@ class RemoteScan:
                     "status": "skip",
                     "detail": "SAPI does not look like mod_php and version not "
                               "confirmed affected; use --confirm-oom to force"}
+        self.checks["detection_hunting"] = {"status": "info", "detail": HUNT_TIPS}
         return self.checks
 
 
@@ -619,6 +1033,21 @@ class RemoteScan:
 INI_FILES = ("php.ini", ".user.ini")
 CONF_HINTS = re.compile(
     r"(php_value|php_flag|php_admin_value|php_admin_flag)\s+([\w.\-]+)\s+(.+)", re.I)
+# php-fpm pool / apache conf bracket syntax: php_admin_flag[key] = val
+POOL_HINTS = re.compile(
+    r"php_(?:admin_)?(?:value|flag)\s*\[\s*([\w.\-]+)\s*\]\s*=\s*([^\s;#]+)", re.I)
+# existing mitigations: WAF/rewrite rules that block the trigger field or
+# multipart bodies outright (eness apache/.htaccess, lighttpd conf,
+# modsecurity rule id 1026109618)
+MITIGATION_HINTS = [
+    (re.compile(r"PHP_SESSION_UPLOAD_PROGRESS", re.I),
+     "blocks PHP_SESSION_UPLOAD_PROGRESS field"),
+    (re.compile(r"multipart/form-data.*(access-deny|deny|\[F|,L\b|status:403|"
+                r"SecRule|access_deny)", re.I | re.S),
+     "blocks multipart/form-data on non-upload routes"),
+    (re.compile(r"1026109618|php2shell", re.I),
+     "php2shell-specific WAF rule present"),
+]
 
 SINKS = [
     (re.compile(r"\bunserialize\s*\("),
@@ -628,6 +1057,11 @@ SINKS = [
     (re.compile(r"ini_set\s*\(\s*['\"]session\.serialize_handler"),
      "runtime session.serialize_handler change — chain-C enabler"),
     (re.compile(r"\bsession_set_save_handler\s*\("), "custom session save handler"),
+    (re.compile(r"\bsession_decode\s*\("),
+     "session_decode() of (possibly tainted) data — unserialize-equivalent sink"),
+    (re.compile(r"\brequest_parse_body\s*\("),
+     "request_parse_body() — PHP 8.4+ parses multipart on non-POST methods "
+     "(widened rfc1867 surface; POST-only WAF rules bypassed)"),
 ]
 
 DANGER_CALLS = re.compile(
@@ -656,17 +1090,60 @@ KNOWN_GADGET_PKGS = {
 
 PHP_EXT_PATTERN = re.compile(r"\.(php|php[3457]?|phtml|inc|module)$")
 
+# Vendor-fixed package versions — an upstream banner alone cannot judge
+# patch status because distros backport (phpcheck-server skill, verified
+# 2026-10-22). (distro_id, VERSION_ID, source-package branch regex,
+# fixed source version, advisory)
+VENDOR_FIXED = [
+    ("debian", "12",    r"php8\.2", "8.2.35-1~deb12u1",                  "DLA-4848-1"),
+    ("debian", "13",    r"php8\.4", "8.4.27-1~deb13u1",                  "DSA-6574-1"),
+    ("ubuntu", "26.10", r"php8\.5", "8.5.9-0ubuntu2.1",                  "USN-8948-1"),
+    ("ubuntu", "26.04", r"php8\.5", "8.5.4-0ubuntu1.5",                  "USN-8948-1"),
+    ("ubuntu", "24.04", r"php8\.3", "8.3.6-0ubuntu0.24.04.13",           "USN-8948-1"),
+    ("ubuntu", "22.04", r"php8\.1", "8.1.2-1ubuntu2.28",                 "USN-8948-1"),
+    ("ubuntu", "20.04", r"php7\.4", "7.4.3-4ubuntu2.29+esm5",            "USN-8948-2 (Ubuntu Pro)"),
+    ("ubuntu", "18.04", r"php7\.2", "7.2.24-0ubuntu0.18.04.17+esm14",    "USN-8948-2 (Ubuntu Pro)"),
+    ("ubuntu", "16.04", r"php7\.0", "7.0.33-0ubuntu0.16.04.16+esm22",    "USN-8948-2 (Ubuntu Pro)"),
+    ("ubuntu", "14.04", r"php5",    "5.5.9+dfsg-1ubuntu4.29+esm18",      "USN-8948-2 (Ubuntu Pro)"),
+    ("rhel",   "8.10",  r"php",     "7.4.33-8.module+el8.10.0+25117+30337cca", "RHSA-2026:87080"),
+    ("rhel",   "9.8",   r"php",     "8.0.30-8.el9_8.1",                  "RHSA-2026:87151"),
+]
+
+HUNT_TIPS = ("incident hunting: grep 'PHP_SESSION_UPLOAD_PROGRESS' in "
+             "web access logs; flag multipart POSTs without Content-Length "
+             "(chunked OOM bypass), multipart parts with hundreds of headers "
+             "or deeply nested a[b][c]... field names (low-bandwidth OOM), "
+             "oversized/quoted filename= values, filenames containing '<?' "
+             "or '|O:' (session/object injection), /sess_ paths in URIs "
+             "(LFI on session files), and multipart POSTs to non-upload "
+             "endpoints (PHP 8.4+ also accepts multipart on PUT/PATCH/DELETE "
+             "via request_parse_body), the comma Content-Type variant "
+             "'multipart/form-data,boundary=' (bypasses semicolon-anchored "
+             "WAF regexes), and bursts of long-lived half-sent multipart "
+             "POSTs from one source (worker pinning, ASLR-bypass setup). "
+             "Response/log side: 'Session object "
+             "destruction failed', 'Allowed memory size ... in Unknown on "
+             "line 0', and anomalous PHPSESSID Set-Cookie values (>=64 chars "
+             "or non-hex — heap leak, Sansec SID 2026112). Host side: alert "
+             "on php-fpm/httpd workers spawning sh/bash/python/curl/wget/nc "
+             "children (e.g. process-watcher in observe mode).")
+
 
 class LocalScan:
     """Audit code/config of an on-disk PHP project."""
 
     TRACKED_KEYS = {
         "session.upload_progress.enabled", "session.serialize_handler",
-        "session.use_only_cookies", "session.save_path",
+        "session.use_only_cookies", "session.use_strict_mode",
+        "session.save_path", "session.name", "session.use_cookies",
         "session.upload_progress.cleanup", "session.upload_progress.min_freq",
+        "session.upload_progress.prefix", "session.upload_progress.name",
+        "fatal_error_backtraces",
         "memory_limit", "post_max_size", "upload_max_filesize",
+        "max_input_vars", "max_file_uploads", "display_errors",
         "expose_php", "disable_functions", "open_basedir",
         "allow_url_include",
+        "opcache.enable", "opcache.file_cache", "opcache.enable_cli",
     }
 
     def __init__(self, root):
@@ -678,6 +1155,23 @@ class LocalScan:
         self._handlers = {}       # serialize_handler value -> [files]
         self._ini_notes = []
         self._settings = {}       # key -> (path, value)
+        self._mitig = []          # existing WAF/config mitigations found
+
+    def _mitigations(self, path, txt):
+        rel = os.path.relpath(path, self.root)
+        for rx, desc in MITIGATION_HINTS:
+            if rx.search(txt):
+                self._mitig.append(f"{desc} in {rel}")
+        # a multipart block that only names POST is bypassable on PHP 8.4+
+        # (request_parse_body parses multipart on PUT/PATCH/DELETE)
+        if re.search(r"multipart/form-data", txt, re.I) and \
+                re.search(r"access-deny|deny|\[F|,L\b|status:403|SecRule",
+                          txt, re.I) and \
+                not re.search(r"\b(PUT|PATCH|DELETE)\b", txt, re.I):
+            self._mitig.append(
+                f"{rel}: multipart block appears POST-only — PHP 8.4 "
+                "request_parse_body() accepts multipart on PUT/PATCH; "
+                "extend the rule or it is bypassable")
 
     def _walk(self):
         for dirpath, dirs, files in os.walk(self.root):
@@ -690,14 +1184,57 @@ class LocalScan:
         if key == "session.serialize_handler":
             self._handlers.setdefault(val.lower(), []).append(src)
         if key == "session.upload_progress.enabled" and val.lower() in ("off", "0"):
-            self._ini_notes.append(f"{src}: upload_progress disabled (good)")
+            self._ini_notes.append(
+                f"{src}: upload_progress disabled — covers the CVE-2026-109619 "
+                "session arms only; does NOT fix CVE-2026-109618 (OOM) — patch "
+                "still required")
         if key == "session.use_only_cookies" and val.lower() in ("0", "off"):
             self._ini_notes.append(f"{src}: use_only_cookies=0 — fixation easier")
+        if key == "session.use_strict_mode" and val.lower() in ("0", "off"):
+            self._ini_notes.append(
+                f"{src}: use_strict_mode=0 — attacker-chosen SIDs accepted verbatim")
+        if key == "fatal_error_backtraces" and val.lower() not in ("0", "off"):
+            self._ini_notes.append(
+                f"{src}: fatal_error_backtraces=On — on PHP 8.5 this is the third "
+                "persistent-variable arm of CVE-2026-109619; set 0 until patched")
         if key == "memory_limit":
             self._ini_notes.append(
                 f"{src}: memory_limit={val} " +
-                ("(OOM trigger harder — good)" if val.strip() == "-1"
-                 else "(OOM reachable)"))
+                ("(counterintuitive but GOOD vs CVE-2026-109618 — removes the "
+                  "predictable alloc failure; do NOT substitute RLIMIT_AS/"
+                  "RLIMIT_DATA, which hit the same vulnerable path)"
+                 if val.strip() == "-1" else "(OOM reachable)"))
+        if key == "display_errors" and val.lower() in ("1", "on", "stdout"):
+            self._ini_notes.append(
+                f"{src}: display_errors=On — makes the error-dependent leak "
+                "path of CVE-2026-109618 easier and leaks fingerprints; set "
+                "Off in production")
+        if key == "max_input_vars":
+            self._ini_notes.append(
+                f"{src}: max_input_vars={val} — the input-var warning is what "
+                "sets headers_sent for the display_errors leak path; lower "
+                "values reach the warning sooner")
+        if key == "session.name" and val.lower() != "phpsessid":
+            self._ini_notes.append(
+                f"{src}: custom session.name={val} — remote rfc1867 SID "
+                "probes must use this cookie name, not PHPSESSID")
+        if key == "session.upload_progress.cleanup" and \
+                val.lower() in ("0", "off"):
+            self._ini_notes.append(
+                f"{src}: upload_progress.cleanup=Off — injected filenames "
+                "persist in session data even after the upload finishes "
+                "(Chain A primitive becomes durable)")
+        if key == "session.upload_progress.name" and \
+                val.upper() != "PHP_SESSION_UPLOAD_PROGRESS":
+            self._ini_notes.append(
+                f"{src}: upload_progress.name={val} — the rfc1867 trigger "
+                "field is renamed; remote probes and WAF rules must match "
+                "this name (--progress-name), not PHP_SESSION_UPLOAD_PROGRESS")
+        if key == "opcache.enable" and val.lower() in ("1", "on"):
+            self._ini_notes.append(
+                f"{src}: OPcache enabled — the OPcache shared-memory arm of "
+                "CVE-2026-109619 has NO ini mitigation; patching is the only "
+                "fix (JFrog three-arms analysis)")
 
     def config_audit(self):
         inis, htaccess, docker, comps, websrv, pools = [], [], [], [], [], []
@@ -713,11 +1250,15 @@ class LocalScan:
                     docker.append(p)
                 elif lf.startswith("docker-compose") or lf in ("compose.yml", "compose.yaml"):
                     comps.append(p)
+                elif f == "www.conf" or \
+                        (lf.endswith(".conf") and "pool" in dirpath):
+                    pools.append(p)   # pool files first — before websrv match
                 elif lf in ("nginx.conf", "httpd.conf", "apache2.conf") or \
-                        (lf.endswith(".conf") and ("pool.d" in dirpath or "fpm" in lf)):
+                        lf.startswith("lighttpd") or \
+                        (lf.endswith(".conf") and "fpm" in lf):
                     websrv.append(p)
-                elif f == "www.conf" or (lf.endswith(".conf") and "pool" in dirpath):
-                    pools.append(p)
+                elif lf == "caddyfile" or lf.endswith(".caddyfile"):
+                    websrv.append(p)
 
         for p in inis:
             try:
@@ -738,6 +1279,11 @@ class LocalScan:
                 k = m.group(2).lower()
                 if k in self.TRACKED_KEYS:
                     self._record_setting(p, k, m.group(3).strip())
+            for m in POOL_HINTS.finditer(txt):
+                if m.group(1).lower() in self.TRACKED_KEYS:
+                    self._record_setting(p, m.group(1).lower(),
+                                         m.group(2).strip().strip('"\''))
+            self._mitigations(p, txt)
             if re.search(r"AddHandler\s+application/x-httpd-php|SetHandler.*php", txt):
                 self._sapi_evidence.add(
                     f"mod_php-style handler in {os.path.relpath(p, self.root)}")
@@ -747,6 +1293,9 @@ class LocalScan:
                 txt = open(p, encoding="utf-8", errors="replace").read()
             except OSError:
                 continue
+            for m in re.finditer(r"-d\s+([\w.\-]+)\s*=\s*([^\s'\"]+)", txt):
+                if m.group(1).lower() in self.TRACKED_KEYS:
+                    self._record_setting(p, m.group(1).lower(), m.group(2))
             for m in re.finditer(r"(?:FROM|image:)\s*php:?([^\s\"':]+)?", txt):
                 tag = m.group(1) or ""
                 ver = re.match(r"(\d+\.\d+(?:\.\d+)?)", tag)
@@ -764,15 +1313,58 @@ class LocalScan:
                 txt = open(p, encoding="utf-8", errors="replace").read()
             except OSError:
                 continue
-            if re.search(r"fastcgi_pass|fastcgi:", txt):
+            for m in POOL_HINTS.finditer(txt):
+                if m.group(1).lower() in self.TRACKED_KEYS:
+                    self._record_setting(p, m.group(1).lower(),
+                                         m.group(2).strip().strip('"\''))
+            self._mitigations(p, txt)
+            if re.search(r"fastcgi_pass|fastcgi:|fastcgi\.server", txt):
                 self._sapi_evidence.add(
                     f"fastcgi/php-fpm in {os.path.relpath(p, self.root)}")
             if re.search(r"php[0-9_]*_module|libphp", txt):
                 self._sapi_evidence.add(
                     f"mod_php in {os.path.relpath(p, self.root)}")
+            if re.search(r"frankenphp|php_server", txt, re.I):
+                self._sapi_evidence.add(
+                    f"FrankenPHP embedded SAPI in {os.path.relpath(p, self.root)}")
+            if re.search(r"mod_fastcgi|scgi\.server", txt, re.I):
+                self._sapi_evidence.add(
+                    f"lighttpd fastcgi in {os.path.relpath(p, self.root)}")
 
+        pool_notes = []
+        for p in pools:
+            try:
+                txt = open(p, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            rel = os.path.relpath(p, self.root)
+            self._sapi_evidence.add(f"php-fpm pool config: {rel}")
+            for m in POOL_HINTS.finditer(txt):
+                if m.group(1).lower() in self.TRACKED_KEYS:
+                    self._record_setting(p, m.group(1).lower(),
+                                         m.group(2).strip().strip('"\''))
+            self._mitigations(p, txt)
+            m = re.search(r"^\s*pm\.max_requests\s*=\s*(\d+)", txt, re.M)
+            if m:
+                n = int(m.group(1))
+                pool_notes.append(
+                    f"{rel}: pm.max_requests={n} " +
+                    ("— worker recycled per request: Chain E stale-state "
+                     "consumer cannot reach the same worker (good)"
+                     if n == 1 else
+                     "— workers persist across requests: Chain E stale-BG "
+                     "consumer viable; pm.max_requests=1 mitigates (perf cost)"))
+            m = re.search(r"^\s*pm\s*=\s*(\w+)", txt, re.M)
+            if m and m.group(1) == "static":
+                pool_notes.append(
+                    f"{rel}: pm=static — predictable worker lifetime, no "
+                    "mitigation value either way")
+
+        def _rel(s):
+            return s if s.startswith("runtime:") else \
+                os.path.relpath(s, self.root)
         if self._settings:
-            det = "\n".join(f"{k} = {v}  [{os.path.relpath(s, self.root)}]"
+            det = "\n".join(f"{k} = {v}  [{_rel(s)}]"
                             for k, (s, v) in sorted(self._settings.items()))
         else:
             det = "no php ini/htaccess settings found"
@@ -783,11 +1375,22 @@ class LocalScan:
             "status": "info",
             "detail": "; ".join(sorted(self._sapi_evidence)) or
                       "no web-server config found"}
+        self.checks["fpm_pool_cfg"] = {
+            "status": "info",
+            "detail": "\n".join(pool_notes) if pool_notes else
+                      "no php-fpm pool config found (Chain E mitigation "
+                      "pm.max_requests=1 not assessable)"}
+        self.checks["mitigations"] = {
+            "status": "info",
+            "detail": "; ".join(sorted(set(self._mitig))) if self._mitig else
+                      "no existing WAF/rewrite mitigations found — consider "
+                      "blocking PHP_SESSION_UPLOAD_PROGRESS or multipart on "
+                      "non-upload routes until patched"}
 
         if len(self._handlers) > 1:
             detail = "; ".join(
                 f"'{h}' in {len(ps)} file(s) "
-                f"({', '.join(os.path.relpath(x, self.root) for x in ps)})"
+                f"({', '.join(x if x.startswith('runtime:') else os.path.relpath(x, self.root) for x in ps)})"
                 for h, ps in self._handlers.items())
             self.checks["serialize_handler_conflict"] = {
                 "status": "exposed",
@@ -848,10 +1451,15 @@ class LocalScan:
 
     def upload_progress_cfg(self):
         v = self._settings.get("session.upload_progress.enabled")
+        src = v[0] if v and not v[0].startswith("runtime:") else \
+            (v[0] if v else None)
         if v and v[1].lower() in ("off", "0"):
-            st, det = "not_exposed", f"disabled in {os.path.relpath(v[0], self.root)}"
+            st, det = ("not_exposed",
+                       f"disabled in {src} — blocks "
+                       "CVE-2026-109619 session arms only; CVE-2026-109618 OOM "
+                       "still applies, patch required")
         elif v:
-            st, det = "exposed", f"enabled in {os.path.relpath(v[0], self.root)} (default anyway)"
+            st, det = "exposed", f"enabled in {src} (default anyway)"
         else:
             st, det = "exposed", "not set → PHP default is On"
         self.checks["upload_progress_cfg"] = {"status": st, "detail": det}
@@ -901,11 +1509,141 @@ class LocalScan:
                                                "no unserialize/LFI/gadget sinks found"}
         self.checks["files_scanned"] = {"status": "info", "detail": f"{n} php files"}
 
+    def runtime_probe(self):
+        """Query the installed php CLI (if any) for effective runtime values.
+
+        On-disk ini files are not necessarily the values in force — the CLI
+        answers what IT loads, and vendor packages may backport the fix at a
+        lower upstream banner (phpcheck-server approach: inspect the actual
+        binary/package, not just the advertised version)."""
+        php = shutil.which("php")
+        if not php:
+            return
+        try:
+            r = subprocess.run(
+                [php, "-r",
+                 'echo PHP_VERSION,"|",PHP_SAPI,"|",'
+                 'ini_get("session.upload_progress.enabled"),"|",'
+                 'ini_get("session.serialize_handler"),"|",'
+                 'ini_get("session.name"),"|",'
+                 'ini_get("display_errors"),"|",'
+                 'ini_get("memory_limit"),"|",'
+                 'ini_get("session.upload_progress.name"),"|",'
+                 'ini_get("opcache.enable");'],
+                capture_output=True, text=True, timeout=15)
+            parts = (r.stdout or "").split("|")
+        except (subprocess.TimeoutExpired, OSError):
+            return
+        if len(parts) < 9:
+            return
+        ver_s, sapi = parts[0], parts[1]
+        m = re.match(r"(\d+)\.(\d+)\.(\d+)", ver_s)
+        ver = tuple(int(x) for x in m.groups()) if m else None
+        st, det = version_state(ver)
+        keys = ("session.upload_progress.enabled", "session.serialize_handler",
+                "session.name", "display_errors", "memory_limit",
+                "session.upload_progress.name", "opcache.enable")
+        for k, v in zip(keys, parts[2:9]):
+            v = v.strip()
+            if v != "":
+                # runtime values override on-disk findings (they are what's
+                # actually in force for this binary)
+                self._record_setting("runtime:php -r", k, v)
+        self.checks["runtime_php"] = {
+            "status": "info",
+            "detail": f"php CLI {ver_s} (SAPI {sapi}) — {det}. Effective ini "
+                      "read from the binary itself; it may differ from "
+                      "on-disk files and from the web SAPI's config"}
+
+    def vendor_packages(self):
+        """Compare installed distro php packages against vendor-fixed
+        revisions — a backported fix ships at a LOWER upstream number, so
+        the upstream banner alone over-reports (Ubuntu/Debian/RHEL ESM)."""
+        osid = osver = None
+        try:
+            for line in open("/etc/os-release"):
+                k, _, v = line.partition("=")
+                if k == "ID":
+                    osid = v.strip().strip('"').lower()
+                elif k == "VERSION_ID":
+                    osver = v.strip().strip('"')
+        except OSError:
+            pass
+        if not osid or osid not in {v[0] for v in VENDOR_FIXED}:
+            return
+        applicable = [v for v in VENDOR_FIXED
+                      if v[0] == osid and osver.startswith(v[1])]
+        if not applicable:
+            self.checks["vendor_packages"] = {
+                "status": "info",
+                "detail": f"{osid} {osver}: no vendor fix data for this "
+                          "release — check the vendor tracker manually"}
+            return
+        pkgs = []
+        if osid in ("debian", "ubuntu") and shutil.which("dpkg-query"):
+            try:
+                r = subprocess.run(
+                    ["dpkg-query", "-W", "-f=${Package} ${Version}\n"],
+                    capture_output=True, text=True, timeout=20)
+                for line in r.stdout.splitlines():
+                    name, _, ver = line.partition(" ")
+                    if re.match(r"php\d", name) or name == "php5":
+                        pkgs.append((name, ver))
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        elif osid == "rhel" and shutil.which("rpm"):
+            try:
+                r = subprocess.run(
+                    ["rpm", "-qa", "php*",
+                     "--queryformat", "%{NAME} %{VERSION}-%{RELEASE}\n"],
+                    capture_output=True, text=True, timeout=20)
+                for line in r.stdout.splitlines():
+                    name, _, ver = line.partition(" ")
+                    if ver:
+                        pkgs.append((name, ver))
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        if not pkgs:
+            self.checks["vendor_packages"] = {"status": "info",
+                                              "detail": "no php packages found"}
+            return
+        lines, worst = [], "info"
+        for name, ver in sorted(pkgs):
+            rule = next((v for v in applicable if re.match(v[2], name)), None)
+            if not rule:
+                continue
+            fixed, adv = rule[3], rule[4]
+            cmp_rc = None
+            if osid in ("debian", "ubuntu") and shutil.which("dpkg"):
+                cmp_rc = subprocess.run(
+                    ["dpkg", "--compare-versions", ver, "ge", fixed]
+                    ).returncode == 0
+            if cmp_rc is True:
+                lines.append(f"{name} {ver} >= {fixed} ({adv}) — patched")
+            elif cmp_rc is False:
+                worst = "exposed"
+                lines.append(f"{name} {ver} < {fixed} ({adv}) — "
+                             "potentially vulnerable")
+            else:
+                worst = "unknown" if worst == "info" else worst
+                lines.append(f"{name} {ver} — compare against fixed {fixed} "
+                             f"({adv}) manually")
+        if worst == "info" and lines:
+            worst = "patched"
+        self.checks["vendor_packages"] = {
+            "status": worst,
+            "detail": "\n".join(lines) or "no php packages matched vendor data"}
+
     def run(self):
         self.config_audit()
+        # runtime after config_audit so the binary's effective ini wins over
+        # on-disk files when they disagree (php -r reads what it loads)
+        self.runtime_probe()
+        self.vendor_packages()
         self.version_discovery()
         self.upload_progress_cfg()
         self.sink_scan()
+        self.checks["detection_hunting"] = {"status": "info", "detail": HUNT_TIPS}
         return self.checks
 
 
@@ -920,6 +1658,8 @@ STATUS_ZH = {
     "not_triggered": "未觸發", "partial": "部分", "skip": "略過",
     "unknown": "未知", "inconclusive": "無法判定", "resisted": "已抵擋",
     "needs_host_check": "待主機確認",
+    "not_applicable": "不適用", "crash_signature": "崩潰特徵",
+    "leak_signature": "洩漏特徵", "likely_patched": "疑似已修補",
 }
 
 SEV_ZH = {"critical": "嚴重", "high": "高", "medium": "中",
@@ -947,16 +1687,219 @@ CHECK_ZH = {
     "composer_gadget_pkgs": "含已知 POP 利用鏈的 composer 套件",
     "code_sinks": "程式碼高風險 sink 掃描（unserialize / LFI / POP gadget）",
     "files_scanned": "已掃描 PHP 檔案數",
+    "fpm_pool_cfg": "PHP-FPM pool 組態（pm.max_requests 為 Chain E 緩解）",
+    "detection_hunting": "日誌狩獵建議（access log 入侵痕跡）",
+    "sid_leak": "Session cookie 記憶體洩漏特徵（CVE-2026-109618 stage-1 原語）",
+    "display_errors": "display_errors 指紋（錯誤輸出助長洩漏型利用路徑）",
+    "edge_waf": "邊緣 WAF/CDN（可能過濾探測，造成無法判定）",
+    "mitigations": "既有 WAF/rewrite 緩解措施",
+    "response_iocs": "回應內容中的利用特徵（stale-BG 消耗 / SAPI OOM / 錯誤洩漏）",
+    "runtime_php": "PHP CLI 執行期版本與生效 ini（磁碟設定可能不同）",
+    "vendor_packages": "發行版套件修補狀態（backport 版本，非上游 banner）",
+    "host_patch_status": "目標主機實際 PHP 二進位/套件修補狀態（ground truth）",
 }
+
+
+def emit_rules(outdir):
+    """Write ready-to-deploy IDS rules derived from the scanner's IoC set:
+    Suricata/Snort, ModSecurity, and Sigma. Mirrors of what we probe —
+    every signature here is also something the scanner checks for."""
+    os.makedirs(outdir, exist_ok=True)
+
+    suricata = r"""# php2shell detection rules — generated by php_scan.py
+# CVE-2026-109618 / CVE-2026-109619 — SID range 2026120-2026139
+
+# request side
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL PHP_SESSION_UPLOAD_PROGRESS in multipart body"; \
+    flow:established,to_server; http.content_type; \
+    content:"multipart/form-data"; http.request_body; \
+    content:"PHP_SESSION_UPLOAD_PROGRESS"; \
+    classtype:web-application-attack; sid:2026120; rev:1; \
+    reference:cve,2026-109618; reference:cve,2026-109619;)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL session name as multipart field (fixation)"; \
+    flow:established,to_server; http.content_type; \
+    content:"multipart/form-data"; http.request_body; \
+    pcre:"/name=\"[A-Za-z0-9_]*sess/i"; \
+    classtype:web-application-attack; sid:2026121; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL PHP code in upload filename (session injection)"; \
+    flow:established,to_server; http.content_type; \
+    content:"multipart/form-data"; http.request_body; \
+    content:"filename=|22|"; content:"<?"; distance:0; within:500; \
+    classtype:web-application-attack; sid:2026122; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL serialized object in filename (handler mismatch)"; \
+    flow:established,to_server; http.content_type; \
+    content:"multipart/form-data"; http.request_body; \
+    content:"filename=|22|"; content:"|7c|O:|22|"; distance:0; within:200; \
+    classtype:web-application-attack; sid:2026123; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL chunked multipart (post_max_size bypass)"; \
+    flow:established,to_server; http.method; content:"POST"; \
+    http.content_type; content:"multipart/form-data"; \
+    http.header; content:"Transfer-Encoding"; content:"chunked"; \
+    classtype:web-application-attack; sid:2026124; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL comma-variant multipart Content-Type (WAF bypass)"; \
+    flow:established,to_server; http.header; \
+    content:"multipart/form-data,"; \
+    classtype:web-application-attack; sid:2026125; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL multipart on non-POST method (request_parse_body)"; \
+    flow:established,to_server; http.method; content:"PUT|PATCH|DELETE"; \
+    http.content_type; content:"multipart/form-data"; \
+    classtype:web-application-attack; sid:2026126; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL header-amplification multipart (low-bandwidth OOM)"; \
+    flow:established,to_server; http.content_type; \
+    content:"multipart/form-data"; http.request_body; \
+    pcre:"/X-[A-Za-z0-9_-]+:\s*[ -~]{400,}/"; \
+    classtype:web-application-attack; sid:2026127; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL deep-nested field names (array-multiplication OOM)"; \
+    flow:established,to_server; http.content_type; \
+    content:"multipart/form-data"; http.request_body; \
+    pcre:"/name=\"[A-Za-z0-9_]+(\[[^\]]*\]){20,}/"; \
+    classtype:web-application-attack; sid:2026128; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL session file path in URI (LFI on sess_ files)"; \
+    flow:established,to_server; http.uri; content:"/sess_"; \
+    classtype:web-application-attack; sid:2026129; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL stalled multipart POST (worker pinning)"; \
+    flow:established,to_server; http.method; content:"POST"; \
+    http.content_type; content:"multipart/form-data"; \
+    threshold:type both, track by_src, count 20, seconds 60; \
+    classtype:web-application-activity; sid:2026130; rev:1;)
+
+# response side
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"PHP2SHELL OOM error in response"; flow:established,to_client; \
+    http.response_body; content:"Allowed memory size"; \
+    content:"exhausted"; distance:0; within:100; \
+    classtype:web-application-attack; sid:2026131; rev:1;)
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"PHP2SHELL OOM in Unknown scope (SAPI-stage longjmp)"; \
+    flow:established,to_client; http.response_body; \
+    content:"Allowed memory size"; content:"Unknown on line 0"; \
+    distance:0; within:300; \
+    classtype:web-application-attack; sid:2026132; rev:1;)
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"PHP2SHELL session destruction failure (stale-BG consumed)"; \
+    flow:established,to_client; http.response_body; \
+    content:"Session object destruction failed"; \
+    classtype:web-application-attack; sid:2026133; rev:1;)
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"PHP2SHELL anomalous session cookie (heap memory leak)"; \
+    flow:established,to_client; http.header; content:"Set-Cookie"; \
+    pcre:"/Set-Cookie:\s*[A-Za-z0-9_.-]*[Ss][Ee][Ss][Ss][^=]*=[a-zA-Z0-9,-]{64,}/"; \
+    classtype:web-application-attack; sid:2026134; rev:1;)
+"""
+
+    modsec = r"""# php2shell ModSecurity rules — generated by php_scan.py
+SecRequestBodyAccess On
+SecRule ARGS_NAMES "@streq PHP_SESSION_UPLOAD_PROGRESS" \
+    "id:1026109618,phase:2,t:none,deny,status:403,log,\
+    msg:'php2shell: upload_progress trigger field (CVE-2026-109618/109619)'"
+SecRule REQUEST_HEADERS:Content-Type "@contains multipart/form-data," \
+    "id:1026109619,phase:1,t:none,deny,status:403,log,\
+    msg:'php2shell: comma-variant multipart Content-Type'"
+SecRule REQUEST_METHOD "@within PUT PATCH DELETE" \
+    "id:1026109620,phase:1,t:none,deny,status:403,log,chain,\
+    msg:'php2shell: non-POST multipart (request_parse_body)'"
+    SecRule REQUEST_HEADERS:Content-Type "@contains multipart/form-data"
+SecRule MULTIPART_FILENAME "@rx <\?(?:php|=)" \
+    "id:1026109621,phase:2,t:none,deny,status:403,log,\
+    msg:'php2shell: PHP code in upload filename'"
+SecRule MULTIPART_FILENAME "@rx \|O:\d+" \
+    "id:1026109622,phase:2,t:none,deny,status:403,log,\
+    msg:'php2shell: serialized object in upload filename'"
+"""
+
+    sigma = r"""# php2shell Sigma rules — generated by php_scan.py
+title: php2shell upload_progress exploitation attempt
+id: php2shell-sigma-001
+status: experimental
+logsource:
+  category: webserver
+detection:
+  sel:
+    cs-method: [POST, PUT, PATCH]
+  kw:
+    - 'PHP_SESSION_UPLOAD_PROGRESS'
+    - 'multipart/form-data,'
+  condition: sel and kw
+level: high
+tags: [cve.2026.109618, cve.2026.109619, attack.t1190]
+---
+title: php2shell exploitation fingerprints in responses/logs
+id: php2shell-sigma-002
+status: experimental
+logsource:
+  category: webserver
+detection:
+  kw:
+    - 'Session object destruction failed'
+    - 'in Unknown on line 0'
+  condition: kw
+level: critical
+tags: [cve.2026.109618, cve.2026.109619]
+---
+title: php2shell suspicious child process of PHP workers
+id: php2shell-sigma-003
+status: experimental
+logsource:
+  category: process_creation
+  product: linux
+detection:
+  parent:
+    ParentImage|endswith: ['/php-fpm', '/php-cgi', '/httpd', '/apache2']
+  child:
+    Image|endswith: ['/sh', '/bash', '/python', '/perl', '/curl',
+                     '/wget', '/nc', '/ncat']
+  condition: parent and child
+level: critical
+tags: [cve.2026.109618]
+"""
+
+    files = {"php2shell-suricata.rules": suricata,
+             "php2shell-modsecurity.conf": modsec,
+             "php2shell-sigma.yml": sigma}
+    for name, content in files.items():
+        p = os.path.join(outdir, name)
+        with open(p, "w") as f:
+            f.write(content.lstrip())
+        print(f"[+] wrote {p}", file=sys.stderr)
+
+
+FILT = {"status": None, "hide": set(), "check_re": None, "min_sev": "info"}
+
+
+def check_visible(key, check):
+    st = check["status"]
+    if FILT["status"] and st not in FILT["status"]:
+        return False
+    if st in FILT["hide"]:
+        return False
+    if FILT["check_re"] and not (
+            FILT["check_re"].search(key) or
+            FILT["check_re"].search(CHECK_ZH.get(key, "")) or
+            FILT["check_re"].search(check["detail"])):
+        return False
+    return True
 
 
 def print_report(title, checks, sev, vp):
     print(f"\n=== php-scan report — {title} [{sev.upper()}] ===")
     for k, c in checks.items():
-        print(f"  [{c['status']:>16}] {k}: {c['detail']}")
+        if check_visible(k, c):
+            print(f"  [{c['status']:>16}] {k}: {c['detail']}")
     print("--- verdict ---")
     for s, line in vp:
-        print(f"  [{s.upper():>8}] {line}")
+        if SEV[s] >= SEV[FILT["min_sev"]]:
+            print(f"  [{s.upper():>8}] {line}")
 
 
 def _xesc(s):
@@ -1016,18 +1959,25 @@ def write_xlsx(path, sheets):
                 x += f'<col min="{i}" max="{i}" width="{w}" customWidth="1"/>'
             x += '</cols>'
         x += '<sheetData>'
+        def colname(n):
+            col = ""
+            while n:
+                n, rem = divmod(n - 1, 26)
+                col = chr(65 + rem) + col
+            return col
+
         for r_i, row in enumerate(rows, 1):
             x += f'<row r="{r_i}">'
             for c_i, cell in enumerate(row):
-                col = ""
-                n = c_i + 1
-                while n:
-                    n, rem = divmod(n - 1, 26)
-                    col = chr(65 + rem) + col
-                x += (f'<c r="{col}{r_i}" t="inlineStr" s="1"><is><t xml:space="preserve">'
-                      f'{_xesc(cell)}</t></is></c>')
+                x += (f'<c r="{colname(c_i + 1)}{r_i}" t="inlineStr" s="1">'
+                      f'<is><t xml:space="preserve">{_xesc(cell)}</t></is></c>')
             x += '</row>'
-        return x + '</sheetData></worksheet>'
+        x += '</sheetData>'
+        # Excel auto-filter dropdowns over the used range (header in row 1)
+        if rows:
+            x += (f'<autoFilter ref="A1:{colname(len(rows[0]))}'
+                  f'{len(rows)}"/>')
+        return x + '</worksheet>'
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("[Content_Types].xml", ct)
@@ -1091,7 +2041,12 @@ def aggregate(checks):
         sev = "critical"
     elif st == "patched":
         out.append(("low", f"{cv['detail']} — core bugs fixed "
-                           "(Chain A filename-injection primitive persists by design)"))
+                           "(commit 3584a98; Chain A filename-injection "
+                           "persists by design, and session fixation + "
+                           "serializer leak need PR #22113 — the probes "
+                           "above verify those separately)"))
+    elif st == "not_applicable":
+        out.append(("info", cv["detail"]))
     else:
         out.append(("medium", cv.get("detail", "version undetermined")))
         bump("medium")
@@ -1133,6 +2088,33 @@ def aggregate(checks):
         out.append(("critical", "CONFIRMED: SAPI-stage OOM signature "
                                 "(CVE-2026-109618 trigger primitive)"))
         sev = "critical"
+    elif om == "crash_signature":
+        out.append(("critical", "CONFIRMED crash signature after OOM probe — "
+                                "worker did not recover (unpatched behavior)"))
+        sev = "critical"
+    elif om == "likely_patched":
+        out.append(("low", "OOM fingerprint points at a concrete code "
+                           "location — patched delayed-OOM shape "
+                           "(zend_handle_delayed_oom), not the unpatched "
+                           "longjmp"))
+    elif om == "partial":
+        out.append(("medium", checks["oom_trigger"]["detail"]))
+        bump("medium")
+
+    hp = checks.get("host_patch_status", {}).get("status")
+    if hp in ("affected", "eol"):
+        out.append(("high", "HOST-CONFIRMED: " +
+                    checks["host_patch_status"]["detail"][:150]))
+        bump("high")
+    elif hp == "patched":
+        out.append(("low", "host binary/package is patched — verify running "
+                           "workers were restarted after the update (they "
+                           "may still serve the old build)"))
+
+    if checks.get("sid_leak", {}).get("status") == "leak_signature":
+        out.append(("critical", "heap memory disclosed via session Set-Cookie "
+                                "(CVE-2026-109618 leak primitive observed)"))
+        sev = "critical"
 
     if checks.get("serialize_handler_conflict", {}).get("status") == "exposed":
         out.append(("high", "dual serialize_handler config "
@@ -1142,6 +2124,20 @@ def aggregate(checks):
     if checks.get("composer_gadget_pkgs", {}).get("status") == "exposed":
         out.append(("medium", "packages with documented POP chains present"))
         bump("medium")
+
+    if checks.get("response_iocs", {}).get("status") == "exposed":
+        out.append(("high", "exploit signatures found in ordinary responses "
+                            "— investigate for active probing/exploitation"))
+        bump("high")
+
+    if checks.get("vendor_packages", {}).get("status") == "exposed":
+        out.append(("high", "installed php packages below the vendor-fixed "
+                            "revision — upgrade via the distro advisory"))
+        bump("high")
+
+    mit = checks.get("mitigations", {}).get("detail", "")
+    if mit and "no existing" not in mit:
+        out.append(("info", "existing mitigations detected: " + mit[:140]))
 
     if not out:
         out.append(("info", "no notable exposure found"))
@@ -1165,6 +2161,22 @@ def verdict(checks):
         if "gadget candidates:" in sinks:
             exp.append("POP gadget candidates present (Chain C weaponization)")
     out.append("Preconditions: " + ("; ".join(exp) if exp else "none confirmed"))
+
+    # exploit-chain map (A..E from the public analysis)
+    sapi = (checks.get("sapi", {}).get("detail", "") +
+            checks.get("sapi_evidence", {}).get("detail", "")).lower()
+    is_fpm = "fpm" in sapi or "fastcgi" in sapi
+    is_mod = "mod_php" in sapi or ("apache" in sapi and "php" in sapi)
+    chains = ["A: session-injection → LFI (works even patched)",
+              "B: var_destroy UAF (needs userland unserialize)"]
+    if is_fpm:
+        chains += ["C: serialize_handler mismatch (FPM)",
+                   "E: FPM stale-BG consumer"]
+    if is_mod:
+        chains += ["D: mod_php SAPI OOM → stale EG()"]
+    if not is_fpm and not is_mod:
+        chains += ["C/E need FPM", "D needs mod_php"]
+    out.append("Applicable chains: " + "; ".join(chains))
     return out
 
 
@@ -1205,6 +2217,12 @@ def main():
     ap.add_argument("--confirm-oom", action="store_true",
                     help="force the SAPI OOM fingerprint probe even when SAPI/"
                          "version heuristics do not call for it")
+    ap.add_argument("--oom-strategy",
+                    choices=["auto", "chunked", "headers", "nested"],
+                    default="auto",
+                    help="OOM probe strategy: chunked (post_max_size bypass), "
+                         "headers (part-header amplification), nested (deep "
+                         "array field names); auto tries all three (default)")
     ap.add_argument("--json", action="store_true", help="emit JSON to stdout")
     ap.add_argument("--output",
                     help="report file path; suffix picks format (.xlsx/.md/.json). "
@@ -1219,14 +2237,56 @@ def main():
                     help="format of the auto-named report (default xlsx)")
     ap.add_argument("--no-report", action="store_true",
                     help="skip writing any report file")
+    ap.add_argument("--progress-name", default="PHP_SESSION_UPLOAD_PROGRESS",
+                    help="value of session.upload_progress.name on the target "
+                         "if it was renamed from the default "
+                         "(local audit reports custom names)")
     ap.add_argument("--cookie",
                     help="Cookie header for authenticated probes, e.g. "
                          "'PHPSESSID=abc123; other=val' (session-id cookies are "
                          "stripped — the scanner supplies its own probe SID)")
     ap.add_argument("--timeout", type=int, default=10)
+    ap.add_argument("--threads", type=int, default=1,
+                    help="parallel workers for batch/crawl remote scans "
+                         "(default 1; raise with care — probes are per-target)")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="only print reports with severity >= medium "
+                         "(reports file still gets everything)")
+    ap.add_argument("--status",
+                    help="only show checks with these statuses, comma-sep "
+                         "(e.g. confirmed,exposed,affected) — applies to "
+                         "console output and report detail rows")
+    ap.add_argument("--hide-status",
+                    help="hide checks with these statuses, comma-sep "
+                         "(e.g. info,unknown,done)")
+    ap.add_argument("--check",
+                    help="only show checks whose name/description/detail "
+                         "matches this regex (e.g. 'oom|upload')")
+    ap.add_argument("--min-severity", choices=list(SEV), default="info",
+                    help="minimum severity for verdict lines (default info)")
+    ap.add_argument("--emit-rules", metavar="DIR",
+                    help="write ready-to-deploy detection rules (Suricata, "
+                         "ModSecurity, Sigma) to DIR, then exit unless "
+                         "scan targets are also given")
     args = ap.parse_args()
 
+    if args.status:
+        FILT["status"] = {s.strip() for s in args.status.split(",") if s.strip()}
+    if args.hide_status:
+        FILT["hide"] = {s.strip() for s in args.hide_status.split(",")
+                        if s.strip()}
+    if args.check:
+        try:
+            FILT["check_re"] = re.compile(args.check, re.I)
+        except re.error as e:
+            ap.error(f"--check: bad regex: {e}")
+    FILT["min_sev"] = args.min_severity
+
+    if args.emit_rules:
+        emit_rules(args.emit_rules)
     if not args.target and not args.targets and not args.path:
+        if args.emit_rules:
+            return 0
         ap.error("give --target/--targets and/or --path")
     if args.exec_cmd and not args.session_path:
         ap.error("--exec-cmd requires --session-path (remote session dir)")
@@ -1261,20 +2321,43 @@ def main():
         print("[!] --confirm without --session-path/--exec-cmd: "
               "host-side checks will be skipped", file=sys.stderr)
 
-    for url in urls:
-        print(f"[*] Remote probe: {url}", file=sys.stderr)
+    def _scan_one(url):
         pp = args.probe_path
         if pp is None:
             pp = urlparse(url if "://" in url else "http://" + url).path or "/"
         checks = RemoteScan(url, pp, args.timeout, host=host_ch,
                             confirm=args.confirm, oom_mb=args.oom_mb,
                             cookie=args.cookie,
-                            force_oom=args.confirm_oom).run()
+                            force_oom=args.confirm_oom,
+                            oom_strategy=args.oom_strategy,
+                            progress_name=args.progress_name).run()
+        return url, checks
+
+    if args.threads > 1 and len(urls) > 1:
+        scanned = {}
+        with ThreadPoolExecutor(max_workers=args.threads) as pool:
+            futs = {pool.submit(_scan_one, u): u for u in urls}
+            done = 0
+            for f in futs:
+                u, c = f.result()
+                scanned[u] = c
+                done += 1
+                print(f"\r[*] scanned {done}/{len(urls)}", end="",
+                      file=sys.stderr, flush=True)
+            print(file=sys.stderr)
+        remote_results = [(u, scanned[u]) for u in urls]
+    else:
+        remote_results = []
+        for url in urls:
+            print(f"[*] Remote probe: {url}", file=sys.stderr)
+            remote_results.append(_scan_one(url))
+
+    for url, checks in remote_results:
         sev, vp = aggregate(checks)
         reports.append({"kind": "remote", "target": url, "path": None,
                         "time": ts, "checks": checks, "severity": sev,
                         "verdict": vp, "verdict_lines": verdict(checks)})
-        if not args.json:
+        if not args.json and (not args.quiet or SEV[sev] >= SEV["medium"]):
             print_report(f"remote: {url}", checks, sev, vp)
 
     if args.path:
@@ -1284,7 +2367,7 @@ def main():
         reports.append({"kind": "local", "target": None, "path": args.path,
                         "time": ts, "checks": checks, "severity": sev,
                         "verdict": vp, "verdict_lines": verdict(checks)})
-        if not args.json:
+        if not args.json and (not args.quiet or SEV[sev] >= SEV["medium"]):
             print_report(f"local: {args.path}", checks, sev, vp)
 
     if args.json:
@@ -1294,8 +2377,10 @@ def main():
         print("It never sends corruption payloads. 'affected' = version/config"
               " exposure, not proof of exploitability.")
 
+    # exit code for CI: 1 when anything high/critical was found, else 0
+    rc = 1 if any(SEV.get(r["severity"], 0) >= SEV["high"] for r in reports) else 0
     if args.no_report:
-        return
+        return rc
     rep_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "reports")
     if args.output:
@@ -1328,10 +2413,13 @@ def main():
             meta.append([ts, tgt, r["path"] or "-", SEV_ZH.get(r["severity"], r["severity"]),
                          "是" if args.confirm else "否", summary])
             for k, c in r["checks"].items():
-                rows.append([ts, tgt, k, STATUS_ZH.get(c["status"], c["status"]),
-                             CHECK_ZH.get(k, ""), c["detail"]])
+                if check_visible(k, c):
+                    rows.append([ts, tgt, k,
+                                 STATUS_ZH.get(c["status"], c["status"]),
+                                 CHECK_ZH.get(k, ""), c["detail"]])
             for s, line in r["verdict"]:
-                vrows.append([ts, tgt, SEV_ZH.get(s, s), line])
+                if SEV[s] >= SEV[FILT["min_sev"]]:
+                    vrows.append([ts, tgt, SEV_ZH.get(s, s), line])
         if os.path.exists(out):
             try:
                 old = load_xlsx(out)
@@ -1351,7 +2439,7 @@ def main():
                          ("檢查明細", rows, [18, 30, 24, 12, 40, 80]),
                          ("判定", vrows, [18, 30, 8, 100])])
         print(f"\n[+] report appended: {out}", file=sys.stderr)
-        return
+        return rc
     if out.endswith(".json"):
         content = json.dumps(reports, indent=2, default=str)
     else:
@@ -1370,7 +2458,8 @@ def main():
     with open(out, "w") as f:
         f.write(content)
     print(f"\n[+] report written: {out}", file=sys.stderr)
+    return rc
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
