@@ -11,6 +11,13 @@ Modes:
   --targets FILE  Batch: one URL per line.
   --path DIR      Local code/config audit (php.ini, .user.ini handler
                   mismatch, unserialize/LFI sinks, __destruct gadgets).
+  --crawl         Recursive same-domain crawl of --target (links + form
+                  endpoints). ON by default when --target is given;
+                  --no-crawl scans only the given URL.
+
+Reports: each run writes ONE timestamped file into <script_dir>/reports/
+(<ts>_scan[-confirm]_<scope>_<host-port>_<SEV>.<fmt>) unless --output is
+given or --cumulative selects the shared php-scan-results.xlsx workbook.
   --confirm       Behavioral confirmation: actually triggers BENIGN
                   primitives and verifies their fingerprints server-side
                   (session file creation, marker in session data, and —
@@ -1165,7 +1172,11 @@ def main():
     ap.add_argument("--crawl", action="store_true",
                     help="recursively crawl the --target domain (same-domain "
                          "links + form endpoints; static assets and external "
-                         "domains skipped) and scan every discovered page")
+                         "domains skipped) and scan every discovered page. "
+                         "ON by default when --target is given")
+    ap.add_argument("--no-crawl", action="store_true",
+                    help="disable the default recursive crawl of --target; "
+                         "scan only the given URL")
     ap.add_argument("--crawl-depth", type=int, default=3,
                     help="max link depth for --crawl (default 3)")
     ap.add_argument("--max-pages", type=int, default=50,
@@ -1192,8 +1203,15 @@ def main():
     ap.add_argument("--json", action="store_true", help="emit JSON to stdout")
     ap.add_argument("--output",
                     help="report file path; suffix picks format (.xlsx/.md/.json). "
-                         "default: <script_dir>/reports/php-scan-results.xlsx "
-                         "(accumulating — each scan appends rows)")
+                         "default: auto-named timestamped file under "
+                         "<script_dir>/reports/ (see --cumulative)")
+    ap.add_argument("--cumulative", action="store_true",
+                    help="append to the shared workbook "
+                         "reports/php-scan-results.xlsx instead of writing a "
+                         "per-run timestamped file")
+    ap.add_argument("--report-format", choices=["xlsx", "md", "json"],
+                    default="xlsx",
+                    help="format of the auto-named report (default xlsx)")
     ap.add_argument("--no-report", action="store_true",
                     help="skip writing any report file")
     ap.add_argument("--cookie",
@@ -1209,15 +1227,16 @@ def main():
         ap.error("--exec-cmd requires --session-path (remote session dir)")
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
     reports = []
 
     urls = ([args.target] if args.target else [])
     if args.targets:
         urls += [l.strip() for l in open(args.targets)
                  if l.strip() and not l.strip().startswith("#")]
-    if args.crawl:
-        if not args.target:
-            ap.error("--crawl requires --target")
+    if args.crawl and not args.target:
+        ap.error("--crawl requires --target")
+    if args.target and not args.no_crawl:
         print(f"[*] Crawling {args.target} "
               f"(depth<={args.crawl_depth}, max {args.max_pages} pages)",
               file=sys.stderr)
@@ -1230,7 +1249,7 @@ def main():
             ap.error(f"crawl failed: {e}")
         print(f"[+] crawl done: {len(pages)} page(s), "
               f"{len(endpoints)} form endpoint(s)", file=sys.stderr)
-        urls = pages + endpoints
+        urls += pages + endpoints
     urls = list(dict.fromkeys(urls))
     host_ch = HostExec(session_path=args.session_path, exec_cmd=args.exec_cmd)
     if args.confirm and urls and not host_ch.available:
@@ -1272,8 +1291,28 @@ def main():
 
     if args.no_report:
         return
-    out = args.output or os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                      "reports", "php-scan-results.xlsx")
+    rep_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "reports")
+    if args.output:
+        out = args.output
+    elif args.cumulative:
+        out = os.path.join(rep_dir, "php-scan-results.xlsx")
+    else:
+        kinds = {r["kind"] for r in reports}
+        scope = "+".join(k for k in ("remote", "local") if k in kinds)
+        worst = max((r["severity"] for r in reports),
+                    key=lambda s: SEV.get(s, 0), default="info").upper()
+        first = next((r["target"] for r in reports if r["target"]), None)
+        if first:
+            p = urlparse(first if "://" in first else "http://" + first)
+            port = p.port or (443 if p.scheme == "https" else 80)
+            hp = re.sub(r"[^A-Za-z0-9.-]", "_", f"{p.hostname}-{port}")
+        else:
+            hp = "local"
+        mode = "scan-confirm" if args.confirm else "scan"
+        out = os.path.join(
+            rep_dir,
+            f"{stamp}_{mode}_{scope}_{hp}_{worst}.{args.report_format}")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     if out.endswith(".xlsx"):
         meta = [["掃描時間", "目標", "本地路徑", "嚴重度", "confirm 模式", "判定摘要"]]
