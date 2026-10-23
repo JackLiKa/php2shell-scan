@@ -13,7 +13,7 @@
 不發送記憶體破壞 payload、不拖垮連線、不注入可執行程式碼（僅惰性標記）。
 
 > ⚖️ **授權**：僅限個人非商業用途（學習、研究、授權測試）。
-> **商用需書面授權——請聯絡 https://github.com/JackLiKa，
+> **商用需書面授權——請聯絡 jacklika.business@gmail.com，
 > 違規商用將被追責。** 詳見 [LICENSE](LICENSE)（三語）。
 
 ---
@@ -161,4 +161,4 @@ python3 php_scan.py --emit-rules ./detection/
 ---
 
 **僅限授權安全評估使用。**
-商用需書面授權——請聯絡 https://github.com/JackLiKa。
+商用需書面授權——請聯絡 jacklika.business@gmail.com。

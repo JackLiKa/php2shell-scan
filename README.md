@@ -15,7 +15,7 @@ connections, never injects executable code (inert markers only).
 
 > ⚖️ **License**: Personal, non-commercial use only (learning, research,
 > authorized testing). **Commercial use requires written permission —
-> contact https://github.com/JackLiKa. Unauthorized commercial use will
+> contact jacklika.business@gmail.com. Unauthorized commercial use will
 > be prosecuted.** See [LICENSE](LICENSE) (trilingual).
 
 ---
@@ -164,4 +164,4 @@ prerequisites + mitigations — never fake "RCE success".
 
 **For authorized security assessment only.**
 Commercial use requires written permission — contact
-https://github.com/JackLiKa.
+jacklika.business@gmail.com.
