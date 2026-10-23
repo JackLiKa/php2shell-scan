@@ -75,6 +75,10 @@ def version_state(ver):
     return "unknown", f"PHP {major}.{minor}.{patch} outside documented range"
 
 
+UA = ("Mozilla/5.0 (compatible; php-scan/1.0; authorized security assessment)")
+BASE_HEADERS = (f"User-Agent: {UA}\r\nAccept: */*\r\nAccept-Language: en\r\n")
+
+
 def status_line(resp):
     return resp.split(b"\r\n", 1)[0].decode("latin1", "replace") if resp else "NO-RESPONSE"
 
@@ -222,8 +226,8 @@ def crawl_site(target, cookie=None, max_pages=50, max_depth=3, timeout=10):
         seen.add(path)
         if STATIC_EXT.search(path):
             continue
-        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n" + cookie_line +
-               "Connection: close\r\n\r\n").encode()
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n" + BASE_HEADERS +
+               cookie_line + "Connection: close\r\n\r\n").encode()
         try:
             resp = http(host, port, req, tls=tls, timeout=timeout)
         except OSError:
@@ -312,7 +316,7 @@ class RemoteScan:
         return f"Cookie: {c}\r\n" if c else ""
 
     def _get(self, path, cookie=None):
-        req = (f"GET {path} HTTP/1.1\r\nHost: {self.host}\r\n"
+        req = (f"GET {path} HTTP/1.1\r\nHost: {self.host}\r\n" + BASE_HEADERS
                + self._cookie_line(cookie)
                + "Connection: close\r\n\r\n").encode()
         return http(self.host, self.port, req, tls=self.tls, timeout=self.timeout)
@@ -325,8 +329,8 @@ class RemoteScan:
                      f'name="{n}"\r\n\r\n{v}\r\n').encode("latin-1")
         body += (f"--{b}\r\nContent-Disposition: form-data; name=\"f\"; "
                  f'filename="{filename}"\r\n\r\nZ\r\n--{b}--\r\n').encode("latin-1")
-        req = (f"POST {path} HTTP/1.1\r\nHost: {self.host}\r\n"
-               f"Content-Type: multipart/form-data; boundary={b}\r\n"
+        req = (f"POST {path} HTTP/1.1\r\nHost: {self.host}\r\n" + BASE_HEADERS
+               + f"Content-Type: multipart/form-data; boundary={b}\r\n"
                + self._cookie_line()
                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
                ).encode() + body
@@ -505,6 +509,7 @@ class RemoteScan:
         # Chunked encoding: no Content-Length → bypasses post_max_size
         # (documented OOM strategy in GHSA-w8hw-w9fx-j79w)
         req = (f"POST {self.probe_path} HTTP/1.1\r\nHost: {self.host}\r\n"
+               + BASE_HEADERS +
                f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
                + self._cookie_line()
                + f"Transfer-Encoding: chunked\r\n"
