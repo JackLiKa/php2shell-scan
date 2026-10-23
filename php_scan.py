@@ -297,7 +297,7 @@ def crawl_site(target, cookie=None, max_pages=50, max_depth=3, timeout=10):
 
 class RemoteScan:
     def __init__(self, target, path="/", timeout=10, host=None, confirm=False,
-                 oom_mb=64, cookie=None, force_oom=False, oom_strategy="auto",
+                 oom_mb=160, cookie=None, force_oom=False, oom_strategy="auto",
                  progress_name="PHP_SESSION_UPLOAD_PROGRESS"):
         u = urlparse(target if "://" in target else "http://" + target)
         self.host = u.hostname
@@ -318,7 +318,27 @@ class RemoteScan:
         self.progress_name = progress_name   # session.upload_progress.name
         self._sid_leak = None           # anomalous session Set-Cookie (heap leak sig)
         self._iocs = []                 # exploit signatures seen in responses
+        self._redirected = None         # Location followed by the last probe
         self.checks = {}
+
+    _REDIR = re.compile(rb"HTTP/1\.\d\s+30[12378]\s")
+
+    @staticmethod
+    def _loc_url(resp):
+        """Location header value on a 30x response, else None."""
+        m = re.search(rb"(?im)^Location:\s*(\S+)",
+                      resp.split(b"\r\n\r\n", 1)[0])
+        return m.group(1).decode("latin1") if m else None
+
+    @staticmethod
+    def _resolve_loc(loc, host, port, tls):
+        """Parse a Location into (host, port, tls, path). Absolute URLs may
+        point at a different host — followed once without a domain check."""
+        if loc.startswith(("http://", "https://")):
+            u = urlparse(loc)
+            return (u.hostname or host, u.port or port,
+                    u.scheme == "https", u.path or "/")
+        return host, port, tls, loc
 
     # response-body exploit signatures (ikow detection SID 2026110/2026111)
     RESPONSE_IOCS = [
@@ -347,10 +367,20 @@ class RemoteScan:
         return f"Cookie: {c}\r\n" if c else ""
 
     def _get(self, path, cookie=None):
-        req = (f"GET {path} HTTP/1.1\r\nHost: {self.host}\r\n" + BASE_HEADERS
-               + self._cookie_line(cookie)
-               + "Connection: close\r\n\r\n").encode()
-        resp = http(self.host, self.port, req, tls=self.tls, timeout=self.timeout)
+        host, port, tls = self.host, self.port, self.tls
+        resp = None
+        for _ in range(2):  # original request + one redirect follow
+            req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n" + BASE_HEADERS
+                   + self._cookie_line(cookie)
+                   + "Connection: close\r\n\r\n").encode()
+            resp = http(host, port, req, tls=tls, timeout=self.timeout)
+            if not resp or not self._REDIR.match(resp):
+                break
+            loc = self._loc_url(resp)
+            if not loc:
+                break
+            self._redirected = loc
+            host, port, tls, path = self._resolve_loc(loc, host, port, tls)
         if resp:
             self._scan_body_iocs(resp.partition(b"\r\n\r\n")[2])
         return resp
@@ -363,12 +393,23 @@ class RemoteScan:
                      f'name="{n}"\r\n\r\n{v}\r\n').encode("latin-1")
         body += (f"--{b}\r\nContent-Disposition: form-data; name=\"f\"; "
                  f'filename="{filename}"\r\n\r\nZ\r\n--{b}--\r\n').encode("latin-1")
-        req = (f"{method} {path} HTTP/1.1\r\nHost: {self.host}\r\n" + BASE_HEADERS
-               + f"Content-Type: multipart/form-data; boundary={b}\r\n"
-               + self._cookie_line()
-               + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
-               ).encode() + body
-        resp = http(self.host, self.port, req, tls=self.tls, timeout=self.timeout)
+        host, port, tls = self.host, self.port, self.tls
+        resp = None
+        for _ in range(2):  # original request + one redirect follow
+            req = (f"{method} {path} HTTP/1.1\r\nHost: {host}\r\n"
+                   + BASE_HEADERS
+                   + f"Content-Type: multipart/form-data; boundary={b}\r\n"
+                   + self._cookie_line()
+                   + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+                   ).encode() + body
+            resp = http(host, port, req, tls=tls, timeout=self.timeout)
+            if not resp or not self._REDIR.match(resp):
+                break
+            loc = self._loc_url(resp)
+            if not loc:
+                break
+            self._redirected = loc
+            host, port, tls, path = self._resolve_loc(loc, host, port, tls)
         if resp:
             self._scan_body_iocs(resp.partition(b"\r\n\r\n")[2])
         return resp
@@ -381,7 +422,11 @@ class RemoteScan:
         head, body = split(resp)
         powered = re.search(r"X-Powered-By:\s*([^\r\n]+)", head, re.I)
         server = re.search(r"Server:\s*([^\r\n]+)", head, re.I)
-        self.checks["reachable"] = {"status": "ok", "detail": head.splitlines()[0] if head else ""}
+        self.checks["reachable"] = {
+            "status": "ok",
+            "detail": (head.splitlines()[0] if head else "") +
+                      (f" — redirected to {self._redirected}"
+                       if self._redirected else "")}
         self.checks["server_header"] = {"status": "info",
                                         "detail": server.group(1).strip() if server else "absent"}
         self.checks["x_powered_by"] = {"status": "info",
@@ -557,12 +602,8 @@ class RemoteScan:
         leak = self._sid_anomaly(head)
         if leak:
             self._sid_leak = leak
-        ok = " 200" in head.split("\r\n", 1)[0] or " 302" in head.split("\r\n", 1)[0]
-        via = (" via PUT — request_parse_body() non-POST multipart surface "
-               "accepted (PHP 8.4+); POST-only WAF rules bypassable"
-               if method == "PUT" and ok else "")
-        # upload_progress rejecting requests usually produces a PHP warning/error
-        rejected = b"upload_progress" in resp.lower() and b"disabled" in resp.lower()
+        sline = head.split("\r\n", 1)[0].strip()
+        ok = re.search(r"HTTP/1\.\d\s+(200|302)", sline) is not None
         # Set-Cookie analysis: did the rfc1867 handler start a session, and did
         # it adopt our POST-body SID?
         sc = re.search(r"Set-Cookie:\s*" + re.escape(self._sess_name) +
@@ -572,10 +613,30 @@ class RemoteScan:
             self._fixation = "confirmed"
         elif sc_val:
             self._fixation = "resisted"
+        # rfc1867 runs pre-RINIT — BEFORE routing decides 404/405. A session
+        # cookie issued on ANY status code is proof the handler fired, so the
+        # exposure verdict must not hinge on the endpoint accepting POST.
+        fired = ok or bool(sc_val)
+        via = (" via PUT — request_parse_body() non-POST multipart surface "
+               "accepted (PHP 8.4+); POST-only WAF rules bypassable"
+               if method == "PUT" else "")
+        if self._redirected:
+            via += f"; redirected to {self._redirected}"
+        # A disabled-feature refusal looks like a PHP warning mentioning
+        # upload_progress + disabled in the same breath. A whole-body
+        # boolean check misfires on phpinfo()-style pages that simply
+        # LIST the setting name and unrelated "disabled" cells.
+        body = resp.partition(b"\r\n\r\n")[2]
+        rejected = re.search(
+            rb"(?im)upload_progress[^\n<>]{0,160}disabl|"
+            rb"warning[^\n]{0,200}upload_progress", body) is not None
         if rejected:
             self.checks["upload_progress"] = {
                 "status": "not_exposed", "detail": "server reports feature disabled"}
-        elif ok:
+        elif fired:
+            pre = f"{sline}: " + ("" if ok else
+                  "endpoint refused the method/path, yet a session cookie was "
+                  "issued — rfc1867 runs pre-RINIT, before app routing; ")
             extra = ("; Set-Cookie echoes probe SID → POST-body fixation "
                      "confirmed remotely" if self._fixation == "confirmed"
                      else "; session cookie issued but SID regenerated"
@@ -584,27 +645,28 @@ class RemoteScan:
                 if self.host_ch.file_exists(f"sess_{sid}"):
                     self.checks["upload_progress"] = {
                         "status": "confirmed",
-                        "detail": f"sess_{sid} created on host — upload_progress "
-                                  "accepted a session id from POST body (pre-auth)"}
+                        "detail": pre + f"sess_{sid} created on host — "
+                                  "upload_progress accepted a session id "
+                                  "from POST body (pre-auth)"}
                     self._fixation = "confirmed"
                     return
                 self.checks["upload_progress"] = {
                     "status": "confirmed" if self._fixation == "confirmed"
                               else "not_confirmed",
-                    "detail": (f"session issued via rfc1867{extra}"
+                    "detail": (pre + f"session issued via rfc1867{extra}"
                                if self._fixation else
-                               f"200 OK but no sess_{sid} found via host channel — "
+                               pre + f"no sess_{sid} found via host channel — "
                                "check session.save_path matches --session-path")}
             else:
                 self.checks["upload_progress"] = {
                     "status": "confirmed" if self._fixation == "confirmed"
                               else "likely_exposed",
-                    "detail": (f"multipart with {self.progress_name} accepted"
-                               + via + extra +
+                    "detail": (pre + f"multipart with {self.progress_name} "
+                               "accepted" + via + extra +
                                " (confirm on host: check sess_" + sid + ")")}
         else:
             self.checks["upload_progress"] = {"status": "unknown",
-                                              "detail": head.split("\r\n", 1)[0]}
+                                              "detail": sline + via}
 
     def session_fixation_probe(self, sid):
         """Send PHPSESSID in POST body, then GET with that SID as cookie.
@@ -714,7 +776,21 @@ class RemoteScan:
         s.close()
         return resp
 
-    def _oom_send_chunked(self):
+    def _oom_ladder_chunked(self):
+        """Chunked bodies carry no Content-Length, so they are NOT bound by
+        post_max_size — the only strategy allowed to escalate: send
+        64 → oom_mb → 256MB, stopping at the first response that already
+        shows the OOM string (or when the connection is cut)."""
+        sizes = sorted({64, self.oom_mb, 256})
+        r, sent = None, 0
+        for mb in sizes:
+            r, sent = self._oom_send_chunked(mb)
+            if r is None or b"Allowed memory size" in \
+                    r.partition(b"\r\n\r\n")[2]:
+                break
+        return r, sent
+
+    def _oom_send_chunked(self, mb):
         """Unbounded body via chunked encoding. Returns (resp, sent_mb)
         or (None, sent_mb) when the connection was cut mid-upload."""
         boundary = "PHPSCANOOM" + uuid.uuid4().hex[:8]
@@ -722,7 +798,7 @@ class RemoteScan:
                      f'Content-Disposition: form-data; name="phpscan_data"\r\n\r\n'
                      ).encode()
         tail = f"\r\n--{boundary}--\r\n".encode()
-        total = self.oom_mb * 1024 * 1024
+        total = mb * 1024 * 1024
         req = (f"POST {self.probe_path} HTTP/1.1\r\nHost: {self.host}\r\n"
                + BASE_HEADERS +
                f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
@@ -823,7 +899,10 @@ class RemoteScan:
         Does NOT attempt corruption — no heap spray, one request per
         strategy only."""
         strategies = {
-            "chunked": self._oom_send_chunked,
+            "chunked": self._oom_ladder_chunked,
+            # Content-Length bodies are bound by post_max_size — a body over
+            # the default 8M may be rejected before memory grows, so
+            # headers/nested run at a fixed --oom-mb estimate (no ladder).
             "headers": lambda: (self._oom_send_headers(), 0),
             "nested": lambda: (self._oom_send_nested(), 0),
         }
@@ -843,8 +922,11 @@ class RemoteScan:
                 "status": "inconclusive",
                 "detail": f"connection cut mid-upload for all strategies "
                           f"({', '.join(order)}; ~{sent_mb}MB sent before drop) "
-                          "— edge/WAF likely dropped the body; OOM fingerprint "
-                          "not testable remotely"}
+                          "— usually edge/WAF dropping the body, BUT a cut on "
+                          "the chunked rung followed by a healthy server is "
+                          "also the patched hard-OOM shape (worker exits on "
+                          "OOM instead of longjmp-ing); indistinguishable "
+                          "remotely — retry from inside the edge"}
             return
 
         leak = self._sid_anomaly(split(resp)[0] if resp else "")
@@ -875,6 +957,11 @@ class RemoteScan:
         crash_sig = ((not resp) or code == 502 or (code == 500 and nbody == 0))
         strat = f" (strategy: {used}" + (f" — earlier tries cut: {', '.join(fails)}"
                                         if fails else "") + ")"
+        if used in ("headers", "nested"):
+            strat += ("; body carries Content-Length — bound by "
+                      "post_max_size (default 8M): an oversized body may be "
+                      "rejected before memory grows, only chunked can "
+                      "bypass that")
         if oom and sapi_scope:
             self.checks["oom_trigger"] = {
                 "status": "confirmed",
@@ -927,10 +1014,14 @@ class RemoteScan:
         elif resp:
             self.checks["oom_trigger"] = {
                 "status": "not_triggered",
-                "detail": f"{status_line_txt}{strat} — memory_limit not "
-                          f"reached with {self.oom_mb}MB (try --oom-mb "
-                          "larger); note display_errors=Off also hides the "
-                          "OOM fingerprint"}
+                "detail": (f"{status_line_txt}{strat} — memory_limit not "
+                           f"reached (~{sent_mb or self.oom_mb}MB sent; "
+                           "display_errors=Off may also hide the OOM "
+                           "fingerprint" +
+                           ("; note: the chunked rung WAS cut mid-upload — "
+                            "that is also the patched hard-OOM shape "
+                            "(worker exits on OOM), ambiguous vs a WAF drop"
+                            if "chunked" in fails else ""))}
         else:
             self.checks["oom_trigger"] = {"status": "unknown",
                                           "detail": "no response"}
@@ -1900,6 +1991,11 @@ def print_report(title, checks, sev, vp):
     for s, line in vp:
         if SEV[s] >= SEV[FILT["min_sev"]]:
             print(f"  [{s.upper():>8}] {line}")
+    if SEV["info"] >= SEV[FILT["min_sev"]]:
+        # last two verdict() lines: Preconditions + Applicable chains map
+        for line in (l for l in verdict(checks)
+                     if l.startswith(("Preconditions:", "Applicable chains:"))):
+            print(f"  [{'INFO':>8}] {line}")
 
 
 def _xesc(s):
@@ -2171,7 +2267,9 @@ def verdict(checks):
               "B: var_destroy UAF (needs userland unserialize)"]
     if is_fpm:
         chains += ["C: serialize_handler mismatch (FPM)",
-                   "E: FPM stale-BG consumer"]
+                   "E: FPM stale-BG consumer (not actively probed — needs "
+                   "intrusive giant-session + OOM; only passive detection "
+                   "via response IoCs)"]
     if is_mod:
         chains += ["D: mod_php SAPI OOM → stale EG()"]
     if not is_fpm and not is_mod:
@@ -2211,9 +2309,12 @@ def main():
     ap.add_argument("--exec-cmd",
                     help="host exec template with {cmd} placeholder, e.g. "
                          "'docker exec php-fpm sh -c \"{cmd}\"' or 'ssh host \"{cmd}\"'")
-    ap.add_argument("--oom-mb", type=int, default=64,
+    ap.add_argument("--oom-mb", type=int, default=160,
                     help="multipart body size for the OOM fingerprint probe "
-                         "(default 64MB)")
+                         "(default 160MB — must exceed the typical 128M "
+                         "memory_limit; chunked bodies already escalate "
+                         "64→oom_mb→256MB, and >8M Content-Length bodies "
+                         "may be rejected under a default post_max_size)")
     ap.add_argument("--confirm-oom", action="store_true",
                     help="force the SAPI OOM fingerprint probe even when SAPI/"
                          "version heuristics do not call for it")
@@ -2420,6 +2521,12 @@ def main():
             for s, line in r["verdict"]:
                 if SEV[s] >= SEV[FILT["min_sev"]]:
                     vrows.append([ts, tgt, SEV_ZH.get(s, s), line])
+            if SEV["info"] >= SEV[FILT["min_sev"]]:
+                for line in r["verdict_lines"]:
+                    if line.startswith(("Preconditions:",
+                                        "Applicable chains:")):
+                        vrows.append([ts, tgt, SEV_ZH.get("info", "info"),
+                                      line])
         if os.path.exists(out):
             try:
                 old = load_xlsx(out)

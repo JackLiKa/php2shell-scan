@@ -36,6 +36,13 @@ New signal depth: **SID heap-leak signature** (anomalous session cookies),
 `Unknown on line 0`), `display_errors` fingerprinting, edge-WAF
 awareness, mitigation audit, and honest negative states.
 
+Verdict fidelity: probes **follow one 30x redirect** (cross-domain
+included) and the rfc1867 exposure verdict fires on **any** status — a
+session `Set-Cookie` on a 404/405 proves the handler ran pre-RINIT,
+before routing. Chunked OOM probes **ladder 64 → `--oom-mb` → 256 MB**
+and stop at the first OOM string; a mid-upload cut on chunked is called
+out as ambiguous (WAF drop *or* patched hard-OOM worker exit).
+
 ## 🚀 Usage
 
 ```bash
@@ -83,7 +90,7 @@ python3 php_scan.py --emit-rules ./detection/
 | `--confirm` | Enable behavioral confirmation |
 | `--session-path DIR` | `session.save_path`, local or via `--exec-cmd` |
 | `--exec-cmd 'TPL'` | Host exec template, `{cmd}` placeholder |
-| `--oom-mb N` | OOM probe body size (default `64`) |
+| `--oom-mb N` | OOM probe body size (default `160`; chunked escalates 64→N→256 MB automatically — `headers`/`nested` carry Content-Length so they stay bound by `post_max_size`) |
 | `--confirm-oom` | Force the OOM probe past SAPI/version heuristics |
 | `--oom-strategy S` | `auto` / `chunked` / `headers` / `nested` |
 | `--json` | Emit JSON to stdout |
@@ -146,8 +153,11 @@ prerequisites + mitigations — never fake "RCE success".
 - Banners can lie — distro backports don't change the version string;
   `host_patch_status` / `vendor_packages` give ground truth when reachable
 - 405 ≠ safe: the rfc1867 handler runs at request startup, **before**
-  routing — confirm via host channel
+  routing — a session `Set-Cookie` on any status now counts as handler
+  fired, but session-file contents still need host-channel confirmation
 - Edge WAF/CDN may drop probes → reported as `inconclusive`, retry inside
+- Chunked upload cut mid-stream is **ambiguous**: WAF drop *or* patched
+  hard-OOM worker exit — indistinguishable remotely
 - Session-file confirmation needs `--session-path` / `--exec-cmd`
 - Code-sink scan is regex-level heuristic
 

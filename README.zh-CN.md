@@ -34,6 +34,13 @@
 `Unknown on line 0`）、`display_errors` 指纹、边缘 WAF 感知、
 缓解措施审计、诚实的阴性状态。
 
+判定保真：探测**跟随一跳 30x 重定向**（含跨域）；rfc1867 暴露判定
+在**任意状态码**上成立——404/405 响应里下发 session `Set-Cookie`
+即证明 handler 在 pre-RINIT 已运行（早于路由）。chunked OOM 探测
+**自动阶梯升级 64 → `--oom-mb` → 256MB**，命中 OOM 字符串即停；
+chunked 中途断连会如实标注为歧义（WAF 丢包 *或* 已修复的
+hard-OOM worker 退出，远程无法区分）。
+
 ## 🚀 用法
 
 ```bash
@@ -81,7 +88,7 @@ python3 php_scan.py --emit-rules ./detection/
 | `--confirm` | 行为确认模式 |
 | `--session-path DIR` | `session.save_path`，本地或经 `--exec-cmd` |
 | `--exec-cmd 'TPL'` | 主机命令模板，`{cmd}` 占位符 |
-| `--oom-mb N` | OOM 探测 body 大小（默认 `64`） |
+| `--oom-mb N` | OOM 探测 body 大小（默认 `160`；chunked 自动 64→N→256MB 阶梯升级——`headers`/`nested` 带 Content-Length 受 `post_max_size` 约束保持定值） |
 | `--confirm-oom` | 跳过 SAPI/版本启发，强制 OOM 探测 |
 | `--oom-strategy S` | `auto` / `chunked` / `headers` / `nested` |
 | `--json` | JSON 输出到 stdout |
@@ -144,8 +151,11 @@ python3 php_scan.py --emit-rules ./detection/
 - banner 可能说谎——发行版 backport 不改版本号；
   `host_patch_status`/`vendor_packages` 可达时给出地面真值
 - 405 ≠ 安全：rfc1867 handler 在 request startup 运行，**早于**路由——
-  需主机通道确认
+  任意状态码上的 session `Set-Cookie` 即判 handler 触发；但 sess 文件
+  内容仍需主机通道确认
 - 边缘 WAF/CDN 可能丢包 → 如实报 `inconclusive`，建议网络内侧重试
+- chunked 上传中途断连**有歧义**：WAF 丢包 *或* 已修复的 hard-OOM
+  worker 退出——远程无法区分
 - sess 文件确认需要 `--session-path` / `--exec-cmd`
 - 代码 sink 扫描是正则级启发式，框架封装/间接调用可能漏检
 
