@@ -16,8 +16,8 @@ Modes:
                   --no-crawl scans only the given URL.
 
 Reports: each run writes ONE timestamped file into <script_dir>/reports/
-(<ts>_scan[-confirm]_<scope>_<host-port>_<SEV>.<fmt>) unless --output is
-given or --cumulative selects the shared php-scan-results.xlsx workbook.
+(<ts>_<domain>_<SEV>.<fmt>) unless --output is given or --cumulative
+selects the shared php-scan-results.xlsx workbook.
   --confirm       Behavioral confirmation: actually triggers BENIGN
                   primitives and verifies their fingerprints server-side
                   (session file creation, marker in session data, and —
@@ -1298,21 +1298,20 @@ def main():
     elif args.cumulative:
         out = os.path.join(rep_dir, "php-scan-results.xlsx")
     else:
-        kinds = {r["kind"] for r in reports}
-        scope = "+".join(k for k in ("remote", "local") if k in kinds)
         worst = max((r["severity"] for r in reports),
                     key=lambda s: SEV.get(s, 0), default="info").upper()
         first = next((r["target"] for r in reports if r["target"]), None)
         if first:
             p = urlparse(first if "://" in first else "http://" + first)
-            port = p.port or (443 if p.scheme == "https" else 80)
-            hp = re.sub(r"[^A-Za-z0-9.-]", "_", f"{p.hostname}-{port}")
+            default_port = 443 if p.scheme == "https" else 80
+            domain = p.hostname or "unknown"
+            if p.port and p.port != default_port:
+                domain += f"-{p.port}"
+            hp = re.sub(r"[^A-Za-z0-9.-]", "_", domain)
         else:
             hp = "local"
-        mode = "scan-confirm" if args.confirm else "scan"
         out = os.path.join(
-            rep_dir,
-            f"{stamp}_{mode}_{scope}_{hp}_{worst}.{args.report_format}")
+            rep_dir, f"{stamp}_{hp}_{worst}.{args.report_format}")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     if out.endswith(".xlsx"):
         meta = [["掃描時間", "目標", "本地路徑", "嚴重度", "confirm 模式", "判定摘要"]]
